@@ -34,9 +34,9 @@ Définissez `LLM_STACK_CONFIG` ou passez `-f /chemin/vers/stack.json` pour utili
 ```sh
 stack list                  # liste les modèles (* = actif)
 stack list-json             # idem, en JSON
-stack start <name>          # démarre un modèle (attend le health check si configuré)
-stack start <name> --no-wait
-stack stop <name>
+stack start <name...>       # démarre un ou plusieurs modèles, dans l'ordre (attend le health check si configuré)
+stack start <name...> --no-wait
+stack stop <name...>
 stack status <name>         # inactive | starting | ready
 ```
 

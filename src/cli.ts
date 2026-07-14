@@ -7,17 +7,25 @@ import { ConsoleLogger } from './Logger';
 import { Orchestrator } from './Orchestrator';
 import { ProcessManager } from './ProcessManager';
 
-const HELP = `Usage: stack [options] <action> [name]
+const HELP = `Usage: stack [options] <action> [name...]
 Options:
   -f, --file <path>  Stack configuration file (default: $LLM_STACK_CONFIG, ./stack.json, or script dir)
 Actions:
   list               List available models (* = active)
   list-json          List available models as JSON
-  start <name>       Start a model
+  start <name...>    Start one or more models, in order
                      --no-wait  Return once the process is running (skip health wait)
-  stop <name>        Stop a model
+  stop <name...>     Stop one or more models
   status <name>      Show launcher status (inactive, starting, ready)
 `;
+
+function assertKnownLaunchers(orchestrator: Orchestrator, names: string[]): void {
+  const known = new Set(orchestrator.getLaunchers().map((launcher) => launcher.name));
+  const unknown = names.filter((n) => !known.has(n));
+  if (unknown.length > 0) {
+    fail(`invalid launcher: ${unknown.join(', ')}`);
+  }
+}
 
 function fail(message: string, withUsage = false): never {
   process.stderr.write(`Error: ${message}\n`);
@@ -43,7 +51,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const [action, name] = positionals;
+  const [action, ...names] = positionals;
+  const name = names[0];
   if (!action) {
     process.stdout.write(HELP);
     process.exitCode = 1;
@@ -84,8 +93,11 @@ async function main(): Promise<void> {
     }
 
     case 'start': {
-      if (!name) fail('missing model name', true);
-      await orchestrator.ensureActive(name, !values['no-wait']);
+      if (names.length === 0) fail('missing model name', true);
+      assertKnownLaunchers(orchestrator, names);
+      for (const n of names) {
+        await orchestrator.ensureActive(n, !values['no-wait']);
+      }
       return;
     }
 
@@ -96,8 +108,11 @@ async function main(): Promise<void> {
     }
 
     case 'stop': {
-      if (!name) fail('missing model name', true);
-      orchestrator.stop(name);
+      if (names.length === 0) fail('missing model name', true);
+      assertKnownLaunchers(orchestrator, names);
+      for (const n of names) {
+        orchestrator.stop(n);
+      }
       return;
     }
 
