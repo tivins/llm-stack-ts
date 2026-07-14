@@ -1,0 +1,81 @@
+{
+    "vram_capacity_in_gigabytes": 16,
+    "launchers": [
+        {
+            "name": "llm_main",
+            "type": "text-generation",
+            "description": "Main text generation model with extended context and reasoning",
+            "command": "/usr/local/bin/llama-server -m /opt/models/example-model.gguf --ctx-size 262144 --reasoning-budget 6144 --models-max 1 --parallel 1 --host 127.0.0.1 --port 8080",
+            "minimal_video_ram_usage_in_gigabytes": 14,
+            "allow_full_cpu": false,
+            "health": {
+                "url": "http://127.0.0.1:8080/health",
+                "timeout_seconds": 300,
+                "interval_ms": 1000
+            }
+        },
+        {
+            "name": "llm_flash",
+            "type": "text-generation",
+            "description": "Lightweight model for quick requests",
+            "command": "/opt/scripts/run_llm.sh -f",
+            "minimal_video_ram_usage_in_gigabytes": 8,
+            "allow_full_cpu": false
+        },
+        {
+            "name": "embedding",
+            "description": "bge-m3",
+            "type": "text-generation",
+            "command": "/usr/local/bin/llama-server -m /opt/models/embbed_model.gguf --embedding --pooling mean --n-gpu-layers 10 --host 127.0.0.1 --port 8081",
+            "minimal_video_ram_usage_in_gigabytes": 0.6,
+            "allow_full_cpu": true,
+            "process_match": "embbed_model.gguf",
+            "health": {
+                "url": "http://127.0.0.1:8081/health",
+                "timeout_seconds": 300,
+                "interval_ms": 1000
+            }
+        },
+        {
+            "name": "rerank",
+            "description": "Qwen3-rerank",
+            "type": "text-generation",
+            "command": "/usr/local/bin/llama-server -m /opt/models/rerank_model.gguf --reranking --pooling rank  --n-gpu-layers 0 --host 127.0.0.1 --port 8082",
+            "minimal_video_ram_usage_in_gigabytes": 0,
+            "allow_full_cpu": true,
+            "process_match": "rerank_model.gguf",
+            "health": {
+                "url": "http://127.0.0.1:8082/health",
+                "timeout_seconds": 300,
+                "interval_ms": 1000
+            }
+        },
+        {
+            "name": "llm_image",
+            "type": "text-to-image",
+            "description": "Image generation from text prompts",
+            "command": "/opt/invokeai/.venv/bin/invokeai-web",
+            "minimal_video_ram_usage_in_gigabytes": 12,
+            "allow_full_cpu": false,
+            "process_match": "invokeai-web"
+        },
+        {
+            "name": "llm_music",
+            "type": "text-to-music",
+            "description": "Music generation from text prompts",
+            "command": "/opt/scripts/run_audio",
+            "minimal_video_ram_usage_in_gigabytes": 4,
+            "allow_full_cpu": false,
+            "process_match": "run_audio"
+        },
+        {
+            "name": "llm_speech",
+            "type": "text-to-speech",
+            "description": "Speech synthesis from text",
+            "command": "/opt/scripts/run_tts",
+            "minimal_video_ram_usage_in_gigabytes": 4,
+            "allow_full_cpu": true,
+            "process_match": "run_tts"
+        }
+    ]
+}
