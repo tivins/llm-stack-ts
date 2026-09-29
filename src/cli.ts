@@ -14,8 +14,9 @@ Actions:
   list               List available models (* = active)
   list-json          List available models as JSON
   start <name...>    Start one or more models, in order
+  run <name...>      Alias of start
                      --no-wait  Return once the process is running (skip health wait)
-  stop <name...>     Stop one or more models
+  stop [name...]     Stop one or more models, or every active model if none is given
   status <name>      Show launcher status (inactive, starting, ready)
 `;
 
@@ -92,7 +93,8 @@ async function main(): Promise<void> {
       return;
     }
 
-    case 'start': {
+    case 'start':
+    case 'run': {
       if (names.length === 0) fail('missing model name', true);
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
@@ -108,7 +110,10 @@ async function main(): Promise<void> {
     }
 
     case 'stop': {
-      if (names.length === 0) fail('missing model name', true);
+      if (names.length === 0) {
+        orchestrator.stopAll();
+        return;
+      }
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
         orchestrator.stop(n);

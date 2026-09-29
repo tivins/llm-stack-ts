@@ -70,6 +70,10 @@ export class Stack {
     this.orchestrator.stop(name);
   }
 
+  stopAll(): void {
+    this.orchestrator.stopAll();
+  }
+
   async status(name: string): Promise<LauncherStatus> {
     return this.orchestrator.getLauncherStatus(name);
   }

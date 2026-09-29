@@ -77,6 +77,12 @@ export class Orchestrator {
     this.process.stop(launcher);
   }
 
+  stopAll(): void {
+    for (const launcher of this.launchers.values()) {
+      this.stop(launcher.name);
+    }
+  }
+
   async checkSMI(): Promise<string> {
     try {
       const proc = Bun.spawn(['nvidia-smi'], { stdout: 'pipe', stderr: 'ignore' });

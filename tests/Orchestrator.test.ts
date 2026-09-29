@@ -112,4 +112,22 @@ describe('Orchestrator', () => {
 
     expect(process.stopCalls).toEqual([]);
   });
+
+  test('stopAll stops every active launcher and skips inactive ones', async () => {
+    const process = new FakeProcessController();
+    const orchestrator = new Orchestrator(process, 32);
+    orchestrator.addLauncher(launcher({ name: 'gpu', minimalVideoRamUsageInGigabytes: 8 }));
+    orchestrator.addLauncher(launcher({ name: 'cpu-only', allowFullCPU: true, minimalVideoRamUsageInGigabytes: 0 }));
+    orchestrator.addLauncher(launcher({ name: 'idle', minimalVideoRamUsageInGigabytes: 4 }));
+
+    await orchestrator.ensureActive('gpu', false);
+    await orchestrator.ensureActive('cpu-only', false);
+
+    orchestrator.stopAll();
+
+    expect(process.stopCalls).toEqual(['gpu', 'cpu-only']);
+    expect(orchestrator.isLauncherActive('gpu')).toBe(false);
+    expect(orchestrator.isLauncherActive('cpu-only')).toBe(false);
+    expect(orchestrator.isLauncherActive('idle')).toBe(false);
+  });
 });

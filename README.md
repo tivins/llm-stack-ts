@@ -35,8 +35,10 @@ Définissez `LLM_STACK_CONFIG` ou passez `-f /chemin/vers/stack.json` pour utili
 stack list                  # liste les modèles (* = actif)
 stack list-json             # idem, en JSON
 stack start <name...>       # démarre un ou plusieurs modèles, dans l'ordre (attend le health check si configuré)
+stack run <name...>         # alias de start
 stack start <name...> --no-wait
-stack stop <name...>
+stack stop                  # arrête tous les modèles actifs
+stack stop <name...>        # arrête un ou plusieurs modèles
 stack status <name>         # inactive | starting | ready
 ```
 
@@ -57,6 +59,7 @@ console.log(stack.listSummary());
 await stack.start('llm_main');
 console.log(await stack.status('llm_main')); // "ready"
 await stack.stop('llm_main');
+stack.stopAll(); // arrête tous les modèles actifs
 
 // Démarrer sans attendre
 await stack.start('llm_main', { noWait: true });
