@@ -56,6 +56,6 @@ describe('cli', () => {
 
     expect(viaRun.code).toBe(1);
     expect(viaRun.stderr).toBe(viaStart.stderr);
-    expect(viaRun.stderr).toContain('missing model name');
+    expect(viaRun.stderr).toContain('missing service name');
   });
 });

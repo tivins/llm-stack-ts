@@ -1,29 +1,48 @@
-import { InvalidLauncherError } from './errors';
+import { InvalidLauncherError, ProcessExitedError } from './errors';
 import { HealthChecker } from './HealthChecker';
+import type { Launcher } from './Launcher';
 import type { LauncherStatus } from './LauncherStatus';
 import type { Logger } from './Logger';
-import type { LlmLauncher } from './LlmLauncher';
-import type { ProcessController } from './ProcessManager';
+import { readLastLines } from './logs';
+import type { ProcessController, ProcessExit, StartedProcess } from './ProcessManager';
+
+/** How long a launcher without health check must survive after start to be considered started. */
+const STARTUP_GRACE_MS = 500;
+const LOG_LINES_ON_FAILURE = 20;
+
+function formatGb(value: number): string {
+  return `${Number(value.toFixed(2))}GB`;
+}
 
 export class Orchestrator {
-  private readonly launchers = new Map<string, LlmLauncher>();
+  private readonly launchers = new Map<string, Launcher>();
   private readonly healthChecker: HealthChecker;
 
   constructor(
     private readonly process: ProcessController,
-    private readonly vramCapacityGb: number,
+    /** No VRAM budget check when undefined. */
+    private readonly vramCapacityGb: number | undefined,
     private readonly logger?: Logger,
     healthChecker?: HealthChecker,
   ) {
     this.healthChecker = healthChecker ?? new HealthChecker();
   }
 
-  addLauncher(launcher: LlmLauncher): void {
+  addLauncher(launcher: Launcher): void {
     this.launchers.set(launcher.name, launcher);
   }
 
-  getLaunchers(): LlmLauncher[] {
+  getLaunchers(): Launcher[] {
     return [...this.launchers.values()];
+  }
+
+  getLauncher(name: string): Launcher {
+    const launcher = this.launchers.get(name);
+    if (!launcher) {
+      throw new InvalidLauncherError(`invalid launcher: ${name}`);
+    }
+
+    return launcher;
   }
 
   async ensureActive(name: string, waitForHealth = true): Promise<void> {
@@ -31,26 +50,42 @@ export class Orchestrator {
 
     if (this.process.isActive(launcher)) {
       if (waitForHealth && launcher.health) {
-        await this.waitForHealth(launcher);
+        await this.waitForHealth(launcher, () => this.process.isActive(launcher));
       }
       return;
     }
 
-    if (!launcher.allowFullCPU) {
-      this.stopOtherGpuLaunchers(name);
-      this.assertFitsInVram(launcher);
+    const toStop = launcher.exclusive
+      ? this.activeLaunchers().filter((other) => other.name !== name && other.exclusive)
+      : [];
+    // Checked before stopping anything, so a refused start leaves the stack untouched.
+    this.assertFitsInVram(launcher, toStop);
+
+    for (const other of toStop) {
+      this.logger?.log(`Stopping ${other.name} (exclusive)...`);
+      this.process.stop(other);
     }
 
-    this.logger?.log(`Starting process ${name}...`);
-    this.process.start(launcher);
+    this.logger?.log(`Starting ${name}...`);
+    const started = this.process.start(launcher);
+    const logFile = this.process.logFile?.(launcher);
+    this.logger?.log(`  pid ${started.pid}${logFile ? `, log: ${logFile}` : ''}`);
 
-    if (waitForHealth && launcher.health) {
-      await this.waitForHealth(launcher);
+    if (waitForHealth) {
+      await this.waitForStartup(launcher, started);
     }
   }
 
   isLauncherActive(name: string): boolean {
     return this.process.isActive(this.getLauncher(name));
+  }
+
+  getLauncherPid(name: string): number | null {
+    return this.process.getPid(this.getLauncher(name));
+  }
+
+  getLauncherLogFile(name: string): string | undefined {
+    return this.process.logFile?.(this.getLauncher(name));
   }
 
   async getLauncherStatus(name: string): Promise<LauncherStatus> {
@@ -73,7 +108,7 @@ export class Orchestrator {
       return;
     }
 
-    this.logger?.log(`Stopping process ${name}...`);
+    this.logger?.log(`Stopping ${name}...`);
     this.process.stop(launcher);
   }
 
@@ -92,49 +127,86 @@ export class Orchestrator {
     }
   }
 
-  private getLauncher(name: string): LlmLauncher {
-    const launcher = this.launchers.get(name);
-    if (!launcher) {
-      throw new InvalidLauncherError(`invalid launcher: ${name}`);
-    }
-
-    return launcher;
+  private activeLaunchers(): Launcher[] {
+    return [...this.launchers.values()].filter((launcher) => this.process.isActive(launcher));
   }
 
-  private stopOtherGpuLaunchers(exceptName: string): void {
-    for (const launcher of this.launchers.values()) {
-      if (launcher.name === exceptName || launcher.allowFullCPU) {
-        continue;
+  /** Waits for a freshly started process: health check if configured, otherwise a short survival check. */
+  private async waitForStartup(launcher: Launcher, started: StartedProcess): Promise<void> {
+    let exit: ProcessExit | undefined;
+    void started.exited.then((result) => {
+      exit = result;
+    });
+    const isAlive = () => exit === undefined && this.process.isActive(launcher);
+
+    try {
+      if (launcher.health) {
+        await this.waitForHealth(launcher, isAlive);
+      } else {
+        await Bun.sleep(STARTUP_GRACE_MS);
+        if (!isAlive()) {
+          throw new ProcessExitedError('Process exited right after start');
+        }
       }
-      if (this.process.isActive(launcher)) {
-        this.process.stop(launcher);
+    } catch (err) {
+      if (!(err instanceof ProcessExitedError)) {
+        throw new Error(this.withLogTail(launcher, err instanceof Error ? err.message : String(err)));
       }
+      // The exit may be observed through /proc slightly before the promise settles.
+      exit ??= await Promise.race([started.exited, Bun.sleep(500).then(() => undefined)]);
+      throw new ProcessExitedError(this.withLogTail(launcher, `${launcher.name} ${this.describeExit(exit)} before becoming ready`));
     }
   }
 
-  private async waitForHealth(launcher: LlmLauncher): Promise<void> {
+  private async waitForHealth(launcher: Launcher, isAlive: () => boolean): Promise<void> {
     const health = launcher.health;
     if (!health) {
       return;
     }
 
     this.logger?.log(`Waiting for ${launcher.name} to become healthy (${health.url})...`);
-    await this.healthChecker.waitUntilHealthy(health, () => this.process.isActive(launcher));
+    await this.healthChecker.waitUntilHealthy(health, isAlive);
     this.logger?.log(`${launcher.name} is healthy.`);
   }
 
-  private assertFitsInVram(launcher: LlmLauncher): void {
-    let usedByOthers = 0;
-    for (const other of this.launchers.values()) {
-      if (other.allowFullCPU || !this.process.isActive(other)) {
-        continue;
-      }
-      usedByOthers += other.minimalVideoRamUsageInGigabytes;
+  private describeExit(exit: ProcessExit | undefined): string {
+    if (exit?.signal) {
+      return `was killed by ${exit.signal}`;
+    }
+    if (exit?.code !== undefined && exit.code !== null) {
+      return `exited with code ${exit.code}`;
+    }
+    return 'exited';
+  }
+
+  private withLogTail(launcher: Launcher, message: string): string {
+    const logFile = this.process.logFile?.(launcher);
+    if (!logFile) {
+      return message;
     }
 
-    const required = usedByOthers + launcher.minimalVideoRamUsageInGigabytes;
-    if (required > this.vramCapacityGb) {
-      throw new Error(`Not enough VRAM for ${launcher.name}: need ${required}GB, capacity is ${this.vramCapacityGb}GB`);
+    const lines = readLastLines(logFile, LOG_LINES_ON_FAILURE);
+    if (lines.length === 0) {
+      return `${message}\nLog file is empty: ${logFile}`;
+    }
+    return `${message}\nLast lines of ${logFile}:\n${lines.map((line) => `  | ${line}`).join('\n')}`;
+  }
+
+  private assertFitsInVram(launcher: Launcher, stopping: Launcher[]): void {
+    if (!launcher.gpu || this.vramCapacityGb === undefined) {
+      return;
+    }
+
+    const users = this.activeLaunchers().filter(
+      (other) => other.gpu && other.name !== launcher.name && !stopping.includes(other),
+    );
+    const usedByOthers = users.reduce((sum, other) => sum + other.vramGb, 0);
+
+    if (usedByOthers + launcher.vramGb > this.vramCapacityGb) {
+      const usedBy = users.length > 0 ? `, ${formatGb(usedByOthers)} used by ${users.map((u) => u.name).join(', ')}` : '';
+      throw new Error(
+        `Not enough VRAM for ${launcher.name}: needs ${formatGb(launcher.vramGb)}${usedBy} (capacity ${formatGb(this.vramCapacityGb)})`,
+      );
     }
   }
 }

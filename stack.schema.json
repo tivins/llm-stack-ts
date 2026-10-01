@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "llm-stack-ts configuration",
+  "type": "object",
+  "required": ["launchers"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "vram_capacity_gb": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "Total VRAM available to gpu launchers. No budget check when omitted."
+    },
+    "vram_capacity_in_gigabytes": { "type": "number", "exclusiveMinimum": 0, "deprecated": true },
+    "launchers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/launcher" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "launcher": {
+      "type": "object",
+      "required": ["name", "command"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "description": { "type": "string" },
+        "type": { "type": "string", "description": "Free-form label, e.g. text-generation or image." },
+        "command": { "type": "string", "description": "Run with bash as `exec <command>`." },
+        "cwd": { "type": "string", "description": "Working directory (a leading ~ is expanded)." },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra environment variables."
+        },
+        "vram_gb": { "type": "number", "minimum": 0, "default": 0 },
+        "gpu": {
+          "type": "boolean",
+          "default": true,
+          "description": "Counts vram_gb against vram_capacity_gb."
+        },
+        "exclusive": {
+          "type": "boolean",
+          "description": "Starting this launcher stops every other running exclusive launcher. Defaults to the value of gpu."
+        },
+        "process_match": {
+          "type": "string",
+          "description": "Substring of the process command line, used to adopt a process started outside stack. Defaults to an exact match on command."
+        },
+        "stop_timeout_seconds": { "type": "integer", "minimum": 1, "default": 10 },
+        "health": { "$ref": "#/$defs/health" },
+        "minimal_video_ram_usage_in_gigabytes": { "type": "number", "minimum": 0, "deprecated": true },
+        "allow_full_cpu": { "type": ["boolean", "string"], "deprecated": true }
+      },
+      "additionalProperties": false
+    },
+    "health": {
+      "type": "object",
+      "required": ["url"],
+      "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "default": 300 },
+        "interval_ms": { "type": "integer", "minimum": 100, "default": 1000 },
+        "expected_status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599,
+          "description": "Exact status to expect. Any 2xx is accepted when omitted."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

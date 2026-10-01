@@ -1,10 +1,12 @@
+import { ProcessExitedError } from './errors';
 import type { LauncherHealth } from './LauncherHealth';
 
 export class HealthChecker {
   async isHealthy(health: LauncherHealth): Promise<boolean> {
     try {
       const response = await fetch(health.url, { signal: AbortSignal.timeout(5000) });
-      return response.status === health.expectedStatus;
+      await response.body?.cancel();
+      return health.expectedStatus === undefined ? response.ok : response.status === health.expectedStatus;
     } catch {
       return false;
     }
@@ -19,7 +21,7 @@ export class HealthChecker {
 
     while (Date.now() < deadline) {
       if (!isProcessAlive()) {
-        throw new Error('Process exited before becoming healthy');
+        throw new ProcessExitedError('Process exited before becoming healthy');
       }
 
       if (await this.isHealthy(health)) {
