@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0 - 2026-10-10
+
+### Added
+
+- Configuration en TOML (`stack.toml`), cherché avant `stack.json`. Le JSON reste accepté.
+- Launchers indexés par nom (`[launchers.<nom>]`) ; l'ancien tableau avec `name` reste accepté.
+- `extends` : un launcher hérite d'un autre, `args`, `env` et `health` sont fusionnés clé par clé. `abstract = true` pour un parent qui ne se démarre pas.
+- `args` : options sous forme de table (`ctx-size = 16384` → `--ctx-size 16384`, `true` pour un flag nu, `false` pour retirer un flag hérité, tableau pour répéter un flag).
+- `kind = "llama-server"` : binaire par défaut, `--host`/`--port` ajoutés à partir des clés `host`/`port`, `health.url` déduite, options courtes (`c`, `m`, `fa`, `np`, `ngl`...) converties en options longues.
+- `vars` et variables `${nom}`, plus `${name}`, `${port}` et `${host}` propres à chaque launcher.
+- `stack migrate` convertit un `stack.json` en `stack.toml` (variantes, parent commun, `vars`) et vérifie que chaque launcher reste identique avant d'écrire.
+- `stack show [name...]` affiche la commande finale après héritage et variables.
+- `stack list -q` affiche seulement les noms.
+- `list-json` et `Stack.listSummary()` exposent `extends`, `model`, `ctxSize`, `reasoningBudget` et `port`.
+- `--arg key[=value]` sur `start`, `run`, `restart` et `show` pour surcharger une option le temps d'un lancement. Librairie : `StackOptions.argOverrides`.
+- `stack validate` signale les fichiers et dossiers absents de la ligne de commande (modèles `.gguf`, `--mmproj`...) et sort en erreur.
+- Librairie : `parseStackConfig`, `readStackFile`, `findMissingPaths`, `migrateStackConfig`.
+
+### Changed
+
+- `stack list` affiche un tableau regroupé par type : modèle, contexte, budget de raisonnement, port, VRAM, et les variantes sous leur parent avec seulement ce qu'elles changent. Ces informations sont aussi relues dans les commandes `llama-server` d'un `stack.json` à l'ancien format.
+- `stack-example.json` est remplacé par `stack-example.toml`.
+- Un nom de launcher peut commencer par `_`.
+
 ## 0.4.0 - 2026-10-01
 
 ### Fixed

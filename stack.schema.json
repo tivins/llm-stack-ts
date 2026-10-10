@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "llm-stack-ts configuration",
+  "description": "stack.toml (or stack.json). In TOML, add `#:schema /path/to/stack.schema.json` on the first line for editor completion.",
   "type": "object",
   "required": ["launchers"],
   "properties": {
@@ -11,21 +12,76 @@
       "description": "Total VRAM available to gpu launchers. No budget check when omitted."
     },
     "vram_capacity_in_gigabytes": { "type": "number", "exclusiveMinimum": 0, "deprecated": true },
+    "vars": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number"] },
+      "description": "Variables usable as ${name} in launcher strings (command, args, cwd, env, health.url...). A variable may use the ones defined before it."
+    },
     "launchers": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/launcher" }
+      "oneOf": [
+        {
+          "type": "object",
+          "description": "Launchers keyed by name.",
+          "propertyNames": { "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*$" },
+          "additionalProperties": { "$ref": "#/$defs/launcher" }
+        },
+        {
+          "type": "array",
+          "description": "Legacy form: each launcher carries its name.",
+          "items": { "allOf": [{ "$ref": "#/$defs/launcher" }, { "required": ["name"] }] }
+        }
+      ]
     }
   },
   "additionalProperties": false,
   "$defs": {
+    "argValue": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "boolean", "description": "true renders a bare flag, false removes an inherited one." },
+        { "type": "array", "items": { "type": ["string", "number"] }, "description": "Repeats the flag once per value." }
+      ]
+    },
     "launcher": {
       "type": "object",
-      "required": ["name", "command"],
       "properties": {
-        "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*$" },
+        "extends": {
+          "type": "string",
+          "description": "Inherit every setting from this launcher; args, env and health are merged key by key."
+        },
+        "abstract": {
+          "type": "boolean",
+          "description": "Only used as a parent: not listed and cannot be started. Not inherited."
+        },
+        "kind": {
+          "enum": ["command", "llama-server"],
+          "default": "command",
+          "description": "llama-server: command defaults to `llama-server`, --host/--port are added from host/port, the health url defaults to http://<host>:<port>/health and short flags (c, m, fa, np, ngl...) are normalized to their long names."
+        },
         "description": { "type": "string" },
         "type": { "type": "string", "description": "Free-form label, e.g. text-generation or image." },
-        "command": { "type": "string", "description": "Run with bash as `exec <command>`." },
+        "command": {
+          "type": "string",
+          "description": "Run with bash as `exec <command> <args>`. Optional for kind = llama-server."
+        },
+        "args": {
+          "type": "object",
+          "propertyNames": { "pattern": "^-{0,2}[A-Za-z0-9][A-Za-z0-9._-]*$" },
+          "additionalProperties": { "$ref": "#/$defs/argValue" },
+          "description": "Options appended to command: `ctx-size = 16384` → --ctx-size 16384, single letters → -x, keys starting with - are kept as is."
+        },
+        "host": {
+          "type": "string",
+          "description": "Available as ${host}. kind = llama-server: --host value (default 127.0.0.1)."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Available as ${port}. kind = llama-server: --port value (default 8080)."
+        },
         "cwd": { "type": "string", "description": "Working directory (a leading ~ is expanded)." },
         "env": {
           "type": "object",
@@ -44,7 +100,7 @@
         },
         "process_match": {
           "type": "string",
-          "description": "Substring of the process command line, used to adopt a process started outside stack. Defaults to an exact match on command."
+          "description": "Substring of the process command line, used to adopt a process started outside stack. Defaults to an exact match on the command line."
         },
         "stop_timeout_seconds": { "type": "integer", "minimum": 1, "default": 10 },
         "health": { "$ref": "#/$defs/health" },
@@ -55,9 +111,11 @@
     },
     "health": {
       "type": "object",
-      "required": ["url"],
       "properties": {
-        "url": { "type": "string", "format": "uri" },
+        "url": {
+          "type": "string",
+          "description": "Required unless inherited or derived (kind = llama-server)."
+        },
         "timeout_seconds": { "type": "integer", "minimum": 1, "default": 300 },
         "interval_ms": { "type": "integer", "minimum": 100, "default": 1000 },
         "expected_status": {

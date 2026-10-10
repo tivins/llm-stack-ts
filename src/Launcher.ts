@@ -1,3 +1,5 @@
+import type { Args } from './args';
+import type { LauncherKind } from './config';
 import type { LauncherHealth } from './LauncherHealth';
 
 export interface Launcher {
@@ -21,6 +23,15 @@ export interface Launcher {
   /** Delay between SIGTERM and SIGKILL when stopping. */
   readonly stopTimeoutSeconds: number;
   readonly health?: LauncherHealth;
+  /** Parent launcher named by `extends` (may be an abstract one, absent from the launcher list). */
+  readonly extends?: string;
+  readonly kind?: LauncherKind;
+  /** `port` key, or the llama-server default. */
+  readonly port?: number;
+  /** Resolved args: inherited ones merged with the launcher's own, variables substituted. */
+  readonly args?: Readonly<Args>;
+  /** The subset of `args` declared by the launcher itself, i.e. what a variant changes. */
+  readonly ownArgs?: Readonly<Args>;
 }
 
 /** @deprecated Use `Launcher`. */

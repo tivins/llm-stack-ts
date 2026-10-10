@@ -2,7 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import { loadStackConfig } from '../src/config';
+import { findMissingPaths, loadStackConfig } from '../src/config';
+import type { Launcher } from '../src/Launcher';
 import { StackConfigError } from '../src/errors';
 
 function writeConfig(content: unknown): string {
@@ -164,5 +165,132 @@ describe('loadStackConfig', () => {
 
   test('rejects a non-existent file', () => {
     expect(() => loadStackConfig('/nonexistent/stack.json')).toThrow(StackConfigError);
+  });
+});
+
+function writeToml(content: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), 'llm-stack-ts-test-'));
+  const file = path.join(dir, 'stack.toml');
+  writeFileSync(file, content);
+  return file;
+}
+
+describe('loadStackConfig (TOML, extends, args)', () => {
+  const BASE = `
+[vars]
+models = "/models"
+
+[launchers._llama]
+abstract = true
+kind = "llama-server"
+command = "/bin/llama-server"
+vram_gb = 14
+health = { timeout_seconds = 60 }
+args = { flash-attn = "on", parallel = 1 }
+
+[launchers.gemma]
+extends = "_llama"
+type = "text-generation"
+args = { m = "\${models}/gemma.gguf", c = 16384, reasoning-budget = 4096 }
+`;
+
+  test('reads launchers keyed by name and skips abstract ones', () => {
+    const config = loadStackConfig(writeToml(BASE));
+
+    expect(config.warnings).toEqual([]);
+    expect(config.launchers.map((l) => l.name)).toEqual(['gemma']);
+  });
+
+  test('llama-server kind renders args, host/port and derives the health url', () => {
+    const [gemma] = loadStackConfig(writeToml(BASE)).launchers;
+
+    expect(gemma?.commandLine).toBe(
+      '/bin/llama-server --flash-attn on --parallel 1 --model /models/gemma.gguf --ctx-size 16384 --reasoning-budget 4096 --host 127.0.0.1 --port 8080',
+    );
+    expect(gemma?.health).toEqual({ url: 'http://127.0.0.1:8080/health', timeoutSeconds: 60, intervalMs: 1000, expectedStatus: undefined });
+    expect(gemma).toMatchObject({ vramGb: 14, type: 'text-generation', gpu: true, exclusive: true });
+  });
+
+  test('a variant merges args key by key, short and long spellings included, and false removes a flag', () => {
+    const file = writeToml(`${BASE}
+[launchers.gemma_long]
+extends = "gemma"
+port = 8090
+args = { ctx-size = 65536, reasoning-budget = false, fa = "off" }
+`);
+    const long = loadStackConfig(file).launchers.find((l) => l.name === 'gemma_long');
+
+    expect(long?.commandLine).toBe(
+      '/bin/llama-server --flash-attn off --parallel 1 --model /models/gemma.gguf --ctx-size 65536 --host 127.0.0.1 --port 8090',
+    );
+    expect(long?.health?.url).toBe('http://127.0.0.1:8090/health');
+  });
+
+  test('arg overrides apply last, only to the named launcher', () => {
+    const file = writeToml(`${BASE}
+[launchers.other]
+extends = "gemma"
+`);
+    const config = loadStackConfig(file, { argOverrides: { gemma: { c: '32768', 'cont-batching': true } } });
+
+    expect(config.launchers[0]?.commandLine).toContain('--ctx-size 32768');
+    expect(config.launchers[0]?.commandLine).toContain('--cont-batching');
+    expect(config.launchers[1]?.commandLine).toContain('--ctx-size 16384');
+  });
+
+  test('command kind appends args and exposes ${port}', () => {
+    const file = writeToml(`
+[launchers.comfy]
+command = "python main.py --port \${port}"
+port = 8188
+args = { listen = "127.0.0.1", lowvram = true, "-x" = "a b" }
+health = { url = "http://127.0.0.1:\${port}/system_stats" }
+`);
+    const [comfy] = loadStackConfig(file).launchers;
+
+    expect(comfy?.commandLine).toBe("python main.py --port 8188 --listen 127.0.0.1 --lowvram -x 'a b'");
+    expect(comfy?.health?.url).toBe('http://127.0.0.1:8188/system_stats');
+  });
+
+  test('unknown variables warn, except in command where bash expands them', () => {
+    const file = writeToml(`
+[launchers.a]
+command = "run \${HOME}"
+args = { model = "\${nope}/x.gguf" }
+`);
+    const config = loadStackConfig(file);
+
+    expect(config.warnings).toEqual([{ level: 'warning', message: "launchers.a references unknown variable 'nope'" }]);
+    expect(config.launchers[0]?.commandLine).toBe("run ${HOME} --model '${nope}/x.gguf'");
+  });
+
+  test('rejects an unknown parent and extends cycles', () => {
+    expect(() => loadStackConfig(writeToml('[launchers.a]\nextends = "b"\n'))).toThrow(/extends unknown launcher 'b'/);
+    expect(() => loadStackConfig(writeToml('[launchers.a]\nextends = "b"\n[launchers.b]\nextends = "a"\n'))).toThrow(/extends cycle/);
+  });
+
+  test('llama-server rejects host or port given as args', () => {
+    const file = writeToml('[launchers.a]\nkind = "llama-server"\nargs = { port = 9000 }\n');
+
+    expect(() => loadStackConfig(file)).toThrow(/use the port key/);
+  });
+
+  test('reports invalid TOML', () => {
+    expect(() => loadStackConfig(writeToml('a = '))).toThrow(/invalid TOML/);
+  });
+});
+
+describe('findMissingPaths', () => {
+  test('lists absolute paths of the command line and cwd that do not exist', () => {
+    const file = writeToml(`
+[launchers.a]
+kind = "llama-server"
+command = "/bin/sh"
+cwd = "/nonexistent/dir"
+args = { model = "/nonexistent/model.gguf", path = "${tmpdir()}" }
+`);
+    const [launcher] = loadStackConfig(file).launchers;
+
+    expect(findMissingPaths(launcher as Launcher)).toEqual(['/nonexistent/dir', '/nonexistent/model.gguf']);
   });
 });

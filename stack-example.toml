@@ -1,0 +1,70 @@
+#:schema ./stack.schema.json
+
+vram_capacity_gb = 16
+
+# Usable as ${name} in commands, args, cwd, env and health urls.
+[vars]
+models = "/opt/models"
+
+# Shared settings for the big models: `abstract` launchers cannot be started,
+# they only exist to be extended.
+[launchers._llama]
+abstract = true
+kind = "llama-server"                    # adds --host/--port and the /health check
+command = "/usr/local/bin/llama-server"  # default: llama-server from $PATH
+type = "text-generation"
+vram_gb = 14
+args = { flash-attn = "on", parallel = 1 }
+
+[launchers.llm_main]
+extends = "_llama"
+description = "Main text generation model with reasoning"
+args = { model = "${models}/example-model.gguf", ctx-size = 32768, reasoning-budget = 6144 }
+
+# A variant only states what changes; `key = false` removes an inherited flag.
+[launchers.llm_main_long]
+extends = "llm_main"
+description = "Same model, long context, no reasoning budget"
+args = { ctx-size = 262144, reasoning-budget = false }
+
+[launchers.llm_flash]
+type = "text-generation"
+description = "Lightweight model started by a script"
+command = "/opt/scripts/run_llm.sh -f"
+vram_gb = 8
+process_match = "flash-model.gguf"
+
+[launchers.comfyui]
+type = "image"
+description = "ComfyUI workflows"
+command = "/opt/comfyui/venv/bin/python main.py --listen 127.0.0.1 --port ${port}"
+cwd = "/opt/comfyui/ComfyUI"
+port = 8188
+vram_gb = 14
+stop_timeout_seconds = 30
+health = { url = "http://127.0.0.1:${port}/system_stats", timeout_seconds = 120 }
+
+[launchers.embedding]
+kind = "llama-server"
+type = "embedding"
+description = "bge-m3, CPU only"
+port = 8081
+gpu = false
+args = { model = "${models}/embed_model.gguf", embedding = true, pooling = "mean", n-gpu-layers = 0 }
+
+[launchers.rerank]
+kind = "llama-server"
+type = "rerank"
+description = "Small reranker kept on the GPU next to the main model"
+port = 8082
+vram_gb = 0.6
+exclusive = false
+args = { model = "${models}/rerank_model.gguf", reranking = true, pooling = "rank", n-gpu-layers = 30 }
+
+[launchers.tts]
+type = "text-to-speech"
+description = "Speech synthesis from text"
+command = "/opt/scripts/run_tts"
+cwd = "~/tts"
+env = { TTS_DEVICE = "cpu" }
+gpu = false

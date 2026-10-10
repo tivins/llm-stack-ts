@@ -1,6 +1,7 @@
 node_modules
 *.log
 stack.json
+stack.toml
 *.pid
 
 /* IDEs */

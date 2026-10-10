@@ -1,5 +1,6 @@
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import type { Args } from './args';
 import { loadStackConfig, resolveStackFile } from './config';
 import type { ConfigWarning, StackConfig } from './config';
 import type { Launcher } from './Launcher';
@@ -10,8 +11,10 @@ import { Orchestrator } from './Orchestrator';
 import { ProcessManager } from './ProcessManager';
 
 export interface StackOptions {
-  /** Explicit path to stack.json. Falls back to $LLM_STACK_CONFIG, then ./stack.json. */
+  /** Explicit path to the stack file. Falls back to $LLM_STACK_CONFIG, then ./stack.toml, then ./stack.json. */
   file?: string;
+  /** Extra args per launcher name, merged over the configuration (same as `stack start <name> --arg ...`). */
+  argOverrides?: Record<string, Args>;
   logger?: Logger;
   /** Directory used for PID files. Defaults to <tmpdir>/stack-llm. */
   pidDir?: string;
@@ -28,6 +31,39 @@ export interface LauncherSummary {
   readonly size: number;
   readonly gpu: boolean;
   readonly exclusive: boolean;
+  /** Parent launcher (`extends`), possibly an abstract one. */
+  readonly extends?: string;
+  /** `args.model` (llama-server model file). */
+  readonly model?: string;
+  /** `args.ctx-size`. */
+  readonly ctxSize?: number;
+  /** `args.reasoning-budget` (-1 = unlimited). */
+  readonly reasoningBudget?: number;
+  readonly port?: number;
+}
+
+/** The fields of `LauncherSummary` taken from the launcher itself (everything but `active`). */
+export function summarizeLauncher(launcher: Launcher): Omit<LauncherSummary, 'active'> {
+  const model = launcher.args?.model;
+  const numeric = (key: string) => {
+    const value = launcher.args?.[key];
+    return typeof value === 'number' || (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value)))
+      ? Number(value)
+      : undefined;
+  };
+  return {
+    name: launcher.name,
+    type: launcher.type,
+    description: launcher.description,
+    size: launcher.vramGb,
+    gpu: launcher.gpu,
+    exclusive: launcher.exclusive,
+    extends: launcher.extends,
+    model: typeof model === 'string' ? model : undefined,
+    ctxSize: numeric('ctx-size'),
+    reasoningBudget: numeric('reasoning-budget'),
+    port: launcher.port,
+  };
 }
 
 export function defaultPidDir(): string {
@@ -40,7 +76,7 @@ export function defaultLogDir(): string {
 }
 
 /** Builds an orchestrator wired to real processes, as used by both the CLI and `Stack`. */
-export function createOrchestrator(config: StackConfig, options: Omit<StackOptions, 'file'> = {}): Orchestrator {
+export function createOrchestrator(config: StackConfig, options: Omit<StackOptions, 'file' | 'argOverrides'> = {}): Orchestrator {
   const logger = options.logger ?? new ConsoleLogger();
   const processManager = new ProcessManager(options.pidDir ?? defaultPidDir(), logger, options.logDir ?? defaultLogDir());
   const orchestrator = new Orchestrator(processManager, config.vramCapacityGb, logger);
@@ -61,7 +97,7 @@ export class Stack {
   readonly warnings: readonly ConfigWarning[];
 
   constructor(options: StackOptions = {}) {
-    const config = loadStackConfig(resolveStackFile(options.file, import.meta.dir));
+    const config = loadStackConfig(resolveStackFile(options.file, import.meta.dir), { argOverrides: options.argOverrides });
     this.warnings = config.warnings;
     this.orchestrator = createOrchestrator(config, options);
   }
@@ -73,15 +109,7 @@ export class Stack {
   listSummary(): Record<string, LauncherSummary> {
     const summary: Record<string, LauncherSummary> = {};
     for (const launcher of this.orchestrator.getLaunchers()) {
-      summary[launcher.name] = {
-        name: launcher.name,
-        type: launcher.type,
-        description: launcher.description,
-        active: this.orchestrator.isLauncherActive(launcher.name),
-        size: launcher.vramGb,
-        gpu: launcher.gpu,
-        exclusive: launcher.exclusive,
-      };
+      summary[launcher.name] = { ...summarizeLauncher(launcher), active: this.orchestrator.isLauncherActive(launcher.name) };
     }
     return summary;
   }
