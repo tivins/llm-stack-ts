@@ -8,6 +8,7 @@ import { findMissingPaths, loadStackConfig, readStackFile, resolveStackFile } fr
 import { formatLauncherList } from './listView';
 import { migrateStackConfig } from './migrate';
 import type { Orchestrator } from './Orchestrator';
+import { describeLease } from './GpuLock';
 import { createOrchestrator, summarizeLauncher } from './Stack';
 
 const HELP = `Usage: stack [options] <action> [name...]
@@ -23,9 +24,13 @@ Actions:
                      --no-wait          Return once the process is spawned
                      --arg key[=value]  Override an arg for this run (repeatable, e.g. --arg ctx-size=65536;
                                         key=false removes an inherited flag)
-  restart <name...>  Stop then start one or more services (accepts --no-wait and --arg)
+                     --force            Do not wait while another client holds the GPU lease
+  restart <name...>  Stop then start one or more services (accepts --no-wait, --arg and --force)
   show [name...]     Print the resolved command line and settings (accepts --arg)
-  stop [name...]     Stop one or more services, or every active service if none is given
+  stop [name...]     Stop one or more services, or every active service if none is given (accepts --force)
+  gpu                Show who holds the GPU lease and who waits for it
+  gpu release --force
+                     Break the current lease (its holder is not told and keeps running)
   logs <name>        Print the end of a service's log
                      -n, --lines <n>  Number of lines (default: 50)
                      -F, --follow     Keep printing new lines
@@ -212,7 +217,8 @@ async function main(): Promise<void> {
     }
   }
 
-  const orchestrator = createOrchestrator(config);
+  const orchestrator = createOrchestrator(config, { holder: 'stack' });
+  const force = values.force;
 
   switch (action) {
     case 'list': {
@@ -248,7 +254,7 @@ async function main(): Promise<void> {
         if (overrides !== undefined && orchestrator.isLauncherActive(n)) {
           process.stderr.write(`Warning: ${n} is already running, use \`stack restart\` to apply --arg\n`);
         }
-        await orchestrator.ensureActive(n, !values['no-wait']);
+        await orchestrator.ensureActive(n, { wait: !values['no-wait'], force });
       }
       return;
     }
@@ -264,8 +270,7 @@ async function main(): Promise<void> {
       if (names.length === 0) fail('missing service name', true);
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
-        orchestrator.stop(n);
-        await orchestrator.ensureActive(n, !values['no-wait']);
+        await orchestrator.restart(n, { wait: !values['no-wait'], force });
       }
       return;
     }
@@ -282,12 +287,28 @@ async function main(): Promise<void> {
 
     case 'stop': {
       if (names.length === 0) {
-        orchestrator.stopAll();
+        await orchestrator.stopAll({ force });
         return;
       }
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
-        orchestrator.stop(n);
+        await orchestrator.stop(n, { force });
+      }
+      return;
+    }
+
+    case 'gpu': {
+      if (name === 'release') {
+        if (!force) fail('`stack gpu release` breaks the lease of a client that may still be using the GPU: add --force');
+        const broken = orchestrator.breakLease();
+        console.log(broken === null ? 'GPU: free, nothing to release' : `Released the lease of ${describeLease(broken)}`);
+        return;
+      }
+      if (name !== undefined) fail(`unknown gpu action '${name}'`, true);
+      const status = orchestrator.leaseStatus();
+      console.log(status?.holder ? `GPU: held by ${describeLease(status.holder)}` : 'GPU: free');
+      if (status && status.waiting.length > 0) {
+        console.log(`Waiting:\n${status.waiting.map((lease) => `  ${describeLease(lease)}`).join('\n')}`);
       }
       return;
     }

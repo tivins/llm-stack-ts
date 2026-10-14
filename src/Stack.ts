@@ -3,11 +3,14 @@ import path from 'node:path';
 import type { Args } from './args';
 import { loadStackConfig, resolveStackFile } from './config';
 import type { ConfigWarning, StackConfig } from './config';
+import { GpuLock } from './GpuLock';
+import type { GpuLease, GpuStatus } from './GpuLock';
 import type { Launcher } from './Launcher';
 import type { LauncherStatus } from './LauncherStatus';
 import { ConsoleLogger } from './Logger';
 import type { Logger } from './Logger';
 import { Orchestrator } from './Orchestrator';
+import type { LeaseOptions, StartOptions, StopOptions } from './Orchestrator';
 import { ProcessManager } from './ProcessManager';
 
 export interface StackOptions {
@@ -20,6 +23,17 @@ export interface StackOptions {
   pidDir?: string;
   /** Directory receiving each launcher's stdout/stderr. Defaults to $XDG_STATE_HOME/llm-stack/logs. */
   logDir?: string;
+  /**
+   * Prefix of the holder text of the GPU leases that start/stop take on their own, shown to the
+   * other clients while they wait (`persona_helper` → `persona_helper: start comfyui`).
+   * Defaults to the script name.
+   */
+  holder?: string;
+}
+
+export interface StackStartOptions extends Omit<StartOptions, 'wait'> {
+  /** Returns once the process is spawned, without waiting for the health check. */
+  noWait?: boolean;
 }
 
 export interface LauncherSummary {
@@ -70,6 +84,11 @@ export function defaultPidDir(): string {
   return path.join(tmpdir(), 'stack-llm');
 }
 
+/** The GPU lease lives next to the PID files: clients that see the same services share it. */
+export function gpuLockDir(pidDir: string): string {
+  return path.join(pidDir, 'gpu');
+}
+
 export function defaultLogDir(): string {
   const stateHome = process.env.XDG_STATE_HOME || path.join(homedir(), '.local', 'state');
   return path.join(stateHome, 'llm-stack', 'logs');
@@ -78,8 +97,12 @@ export function defaultLogDir(): string {
 /** Builds an orchestrator wired to real processes, as used by both the CLI and `Stack`. */
 export function createOrchestrator(config: StackConfig, options: Omit<StackOptions, 'file' | 'argOverrides'> = {}): Orchestrator {
   const logger = options.logger ?? new ConsoleLogger();
-  const processManager = new ProcessManager(options.pidDir ?? defaultPidDir(), logger, options.logDir ?? defaultLogDir());
-  const orchestrator = new Orchestrator(processManager, config.vramCapacityGb, logger);
+  const pidDir = options.pidDir ?? defaultPidDir();
+  const processManager = new ProcessManager(pidDir, logger, options.logDir ?? defaultLogDir());
+  const orchestrator = new Orchestrator(processManager, config.vramCapacityGb, logger, undefined, {
+    lock: new GpuLock(gpuLockDir(pidDir)),
+    holder: options.holder ?? path.basename(process.argv[1] ?? 'bun'),
+  });
   for (const launcher of config.launchers) {
     orchestrator.addLauncher(launcher);
   }
@@ -114,21 +137,43 @@ export class Stack {
     return summary;
   }
 
-  async start(name: string, options: { noWait?: boolean } = {}): Promise<void> {
-    await this.orchestrator.ensureActive(name, !options.noWait);
+  /**
+   * Starts the service and waits for its health check. A GPU service waits for the GPU lease
+   * when another client holds it (unless `lease`, `force`, or inside `withLease`).
+   */
+  async start(name: string, options: StackStartOptions = {}): Promise<void> {
+    await this.orchestrator.ensureActive(name, { ...options, wait: !options.noWait });
   }
 
-  async restart(name: string, options: { noWait?: boolean } = {}): Promise<void> {
-    this.orchestrator.stop(name);
-    await this.orchestrator.ensureActive(name, !options.noWait);
+  async restart(name: string, options: StackStartOptions = {}): Promise<void> {
+    await this.orchestrator.restart(name, { ...options, wait: !options.noWait });
   }
 
-  stop(name: string): void {
-    this.orchestrator.stop(name);
+  /** Resolves once the process has exited. */
+  async stop(name: string, options: StopOptions = {}): Promise<void> {
+    await this.orchestrator.stop(name, options);
   }
 
-  stopAll(): void {
-    this.orchestrator.stopAll();
+  async stopAll(options: StopOptions = {}): Promise<void> {
+    await this.orchestrator.stopAll(options);
+  }
+
+  /**
+   * Runs `fn` holding the GPU lease, then releases it, even on error. No other client of the
+   * stack can start or stop a GPU service meanwhile; start/stop inside `fn` use this lease.
+   */
+  async withLease<T>(options: LeaseOptions, fn: (lease: GpuLease) => Promise<T>): Promise<T> {
+    return this.orchestrator.withLease(options, fn);
+  }
+
+  /** Waits for the GPU lease. Release it with `lease.release()`; pass it to start/stop as `{ lease }`. */
+  async acquire(options: LeaseOptions): Promise<GpuLease> {
+    return this.orchestrator.acquireLease(options);
+  }
+
+  /** Who holds the GPU lease, and who waits for it. */
+  gpu(): GpuStatus {
+    return this.orchestrator.leaseStatus() ?? { holder: null, waiting: [] };
   }
 
   async status(name: string): Promise<LauncherStatus> {

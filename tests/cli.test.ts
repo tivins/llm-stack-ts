@@ -102,4 +102,13 @@ describe('cli', () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toContain('llm: path not found: /nonexistent/m.gguf');
   });
+
+  test('gpu release refuses to break the lease without --force', async () => {
+    const file = writeConfig();
+
+    const result = await runCli(['-f', file, 'gpu', 'release']);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('add --force');
+  });
 });

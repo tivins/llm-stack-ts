@@ -1,6 +1,8 @@
 #:schema ./stack.schema.json
 
-vram_capacity_gb = 16
+# VRAM the stack may use, not the card's total: leave room for the desktop and the
+# browser (here, a 16 GB card).
+vram_capacity_gb = 15
 
 # Usable as ${name} in commands, args, cwd, env and health urls.
 [vars]

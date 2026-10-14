@@ -42,9 +42,9 @@ function processesMatching(pattern: string): number[] {
     .map(Number);
 }
 
-afterEach(() => {
+afterEach(async () => {
   for (const [manager, l] of started.splice(0)) {
-    manager.stop(l);
+    await manager.stop(l);
   }
 });
 
@@ -75,9 +75,29 @@ describe('ProcessManager', () => {
     // The two sleeps plus the `bash -c` wrapper, whose command line contains them too.
     expect(processesMatching(`sleep ${duration}`)).toHaveLength(3);
 
-    manager.stop(l);
+    await manager.stop(l);
 
     expect(processesMatching(`sleep ${duration}`)).toEqual([]);
+    expect(manager.isActive(l)).toBe(false);
+  });
+
+  test('stop does not block the event loop while the process ignores SIGTERM', async () => {
+    const { manager } = setup();
+    const duration = uniqueSleep();
+    const l = launcher({
+      name: 'stubborn',
+      commandLine: `bash -c 'trap "" TERM; while true; do sleep ${duration}; done'`,
+      stopTimeoutSeconds: 1,
+    });
+    start(manager, l);
+    await Bun.sleep(200);
+
+    let ticks = 0;
+    const timer = setInterval(() => ticks++, 50);
+    await manager.stop(l);
+    clearInterval(timer);
+
+    expect(ticks).toBeGreaterThanOrEqual(10);
     expect(manager.isActive(l)).toBe(false);
   });
 
@@ -88,7 +108,7 @@ describe('ProcessManager', () => {
 
     start(manager, { ...l, env: { RUN: 'one' } });
     await Bun.sleep(200);
-    manager.stop(l);
+    await manager.stop(l);
     start(manager, { ...l, env: { RUN: 'two' } });
     await Bun.sleep(200);
 

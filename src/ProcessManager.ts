@@ -2,6 +2,8 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import path from 'node:path';
 import type { Launcher } from './Launcher';
 import type { Logger } from './Logger';
+import { readProcStat } from './proc';
+import type { ProcStat } from './proc';
 
 export interface ProcessExit {
   readonly code: number | null;
@@ -18,15 +20,10 @@ export interface ProcessController {
   isActive(launcher: Launcher): boolean;
   getPid(launcher: Launcher): number | null;
   start(launcher: Launcher): StartedProcess;
-  stop(launcher: Launcher): void;
+  /** Resolves once the process group has exited (SIGTERM, then SIGKILL after `stopTimeoutSeconds`). */
+  stop(launcher: Launcher): Promise<void>;
   /** Path of the file receiving the launcher's stdout/stderr, if any. */
   logFile?(launcher: Launcher): string;
-}
-
-interface ProcStat {
-  readonly state: string;
-  readonly pgrp: number;
-  readonly startTime: string;
 }
 
 interface TrackedPid {
@@ -104,7 +101,7 @@ export class ProcessManager implements ProcessController {
     return { pid: proc.pid, exited };
   }
 
-  stop(launcher: Launcher): void {
+  async stop(launcher: Launcher): Promise<void> {
     const pid = this.resolvePid(launcher);
     if (pid !== null) {
       // Processes we start lead their own group: signal the whole group so
@@ -114,10 +111,10 @@ export class ProcessManager implements ProcessController {
       const isAlive = group ? () => this.isGroupAlive(pid) : () => this.isRunning(pid);
 
       this.signal(pid, group, 'SIGTERM');
-      if (!this.waitUntil(() => !isAlive(), launcher.stopTimeoutSeconds * 1000)) {
+      if (!(await this.waitUntil(() => !isAlive(), launcher.stopTimeoutSeconds * 1000))) {
         this.logger?.log(`${launcher.name} did not exit after ${launcher.stopTimeoutSeconds}s, sending SIGKILL`);
         this.signal(pid, group, 'SIGKILL');
-        this.waitUntil(() => !isAlive(), 2000);
+        await this.waitUntil(() => !isAlive(), 2000);
       }
     }
     this.removePidFile(launcher.name);
@@ -260,22 +257,7 @@ export class ProcessManager implements ProcessController {
   }
 
   private readStat(pid: number): ProcStat | null {
-    let content: string;
-    try {
-      content = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-    } catch {
-      return null;
-    }
-
-    // "pid (comm) state ppid pgrp ..." — comm may contain spaces and parentheses.
-    const fields = content.slice(content.lastIndexOf(')') + 2).split(' ');
-    const state = fields[0];
-    const pgrp = Number.parseInt(fields[2] ?? '', 10);
-    const startTime = fields[19];
-    if (state === undefined || Number.isNaN(pgrp) || startTime === undefined) {
-      return null;
-    }
-    return { state, pgrp, startTime };
+    return readProcStat(pid);
   }
 
   private readCmdline(pid: number): string | null {
@@ -306,13 +288,13 @@ export class ProcessManager implements ProcessController {
     }
   }
 
-  private waitUntil(condition: () => boolean, timeoutMs: number): boolean {
+  private async waitUntil(condition: () => boolean, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (condition()) {
         return true;
       }
-      Bun.sleepSync(100);
+      await Bun.sleep(100);
     }
     return condition();
   }

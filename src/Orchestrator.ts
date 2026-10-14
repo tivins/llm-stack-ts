@@ -1,10 +1,13 @@
-import { InvalidLauncherError, ProcessExitedError } from './errors';
+import { GpuLeaseLostError, InvalidLauncherError, ProcessExitedError } from './errors';
+import { describeLease, formatDuration } from './GpuLock';
+import type { GpuLease, GpuLock, GpuStatus, LeaseInfo } from './GpuLock';
 import { HealthChecker } from './HealthChecker';
 import type { Launcher } from './Launcher';
 import type { LauncherStatus } from './LauncherStatus';
 import type { Logger } from './Logger';
 import { readLastLines } from './logs';
 import type { ProcessController, ProcessExit, StartedProcess } from './ProcessManager';
+import { sleep } from './sleep';
 
 /** How long a launcher without health check must survive after start to be considered started. */
 const STARTUP_GRACE_MS = 500;
@@ -12,6 +15,43 @@ const LOG_LINES_ON_FAILURE = 20;
 
 function formatGb(value: number): string {
   return `${Number(value.toFixed(2))}GB`;
+}
+
+/** Starting or stopping it changes what holds the GPU, so it takes the GPU lease. */
+function usesGpu(launcher: Launcher): boolean {
+  return launcher.gpu || launcher.exclusive;
+}
+
+export interface StopOptions {
+  /** GPU lease held by the caller. Without it, and outside `withLease`, the call takes one for its own duration. */
+  lease?: GpuLease;
+  /** Skips the GPU lease: acts even while another client holds the GPU (`--force`). */
+  force?: boolean;
+  /** Stops waiting for the GPU lease. */
+  signal?: AbortSignal;
+}
+
+export interface StartOptions extends StopOptions {
+  /** Waits for the health check, or a short survival check without one (default: true). */
+  wait?: boolean;
+  /**
+   * Stops waiting for the GPU lease or the health check. A process started by this call is
+   * then stopped; a service that was already running is left alone.
+   */
+  signal?: AbortSignal;
+}
+
+export interface LeaseOptions {
+  /** Free text shown to the other clients while they wait, and by `stack gpu`. */
+  holder: string;
+  /** Leaves the queue. */
+  signal?: AbortSignal;
+}
+
+export interface OrchestratorGpu {
+  lock: GpuLock;
+  /** Prefix of the holder text of the leases taken implicitly by start/stop, e.g. `stack` → `stack: start gemma`. */
+  holder: string;
 }
 
 export class Orchestrator {
@@ -24,6 +64,8 @@ export class Orchestrator {
     private readonly vramCapacityGb: number | undefined,
     private readonly logger?: Logger,
     healthChecker?: HealthChecker,
+    /** GPU lease shared with the other clients; without it, start/stop never wait. */
+    private readonly gpu?: OrchestratorGpu,
   ) {
     this.healthChecker = healthChecker ?? new HealthChecker();
   }
@@ -45,35 +87,65 @@ export class Orchestrator {
     return launcher;
   }
 
-  async ensureActive(name: string, waitForHealth = true): Promise<void> {
+  async ensureActive(name: string, options: StartOptions = {}): Promise<void> {
     const launcher = this.getLauncher(name);
+    const wait = options.wait ?? true;
 
     if (this.process.isActive(launcher)) {
-      if (waitForHealth && launcher.health) {
-        await this.waitForHealth(launcher, () => this.process.isActive(launcher));
+      if (wait && launcher.health) {
+        await this.waitForHealth(launcher, () => this.process.isActive(launcher), options.signal);
       }
       return;
     }
 
-    const toStop = launcher.exclusive
-      ? this.activeLaunchers().filter((other) => other.name !== name && other.exclusive)
-      : [];
-    // Checked before stopping anything, so a refused start leaves the stack untouched.
-    this.assertFitsInVram(launcher, toStop);
+    await this.withGpu(`start ${name}`, usesGpu(launcher), options, async () => {
+      // Another client may have started it while we waited for the GPU.
+      if (this.process.isActive(launcher)) {
+        if (wait && launcher.health) {
+          await this.waitForHealth(launcher, () => this.process.isActive(launcher), options.signal);
+        }
+        return;
+      }
 
-    for (const other of toStop) {
-      this.logger?.log(`Stopping ${other.name} (exclusive)...`);
-      this.process.stop(other);
-    }
+      const toStop = launcher.exclusive
+        ? this.activeLaunchers().filter((other) => other.name !== name && other.exclusive)
+        : [];
+      // Checked before stopping anything, so a refused start leaves the stack untouched.
+      this.assertFitsInVram(launcher, toStop);
 
-    this.logger?.log(`Starting ${name}...`);
-    const started = this.process.start(launcher);
-    const logFile = this.process.logFile?.(launcher);
-    this.logger?.log(`  pid ${started.pid}${logFile ? `, log: ${logFile}` : ''}`);
+      for (const other of toStop) {
+        this.logger?.log(`Stopping ${other.name} (exclusive)...`);
+        await this.process.stop(other);
+      }
+      options.signal?.throwIfAborted();
 
-    if (waitForHealth) {
-      await this.waitForStartup(launcher, started);
-    }
+      this.logger?.log(`Starting ${name}...`);
+      const started = this.process.start(launcher);
+      const logFile = this.process.logFile?.(launcher);
+      this.logger?.log(`  pid ${started.pid}${logFile ? `, log: ${logFile}` : ''}`);
+
+      if (!wait) {
+        return;
+      }
+      try {
+        await this.waitForStartup(launcher, started, options.signal);
+      } catch (err) {
+        if (options.signal?.aborted && this.process.isActive(launcher)) {
+          this.logger?.log(`Start of ${name} cancelled, stopping it...`);
+          await this.process.stop(launcher);
+        }
+        throw err;
+      }
+    });
+  }
+
+  /** Stop then start, under a single GPU lease: no other client can take the GPU in between. */
+  async restart(name: string, options: StartOptions = {}): Promise<void> {
+    const launcher = this.getLauncher(name);
+    await this.withGpu(`restart ${name}`, usesGpu(launcher), options, async () => {
+      await this.stopLauncher(launcher);
+      await this.ensureActive(name, options);
+    });
   }
 
   isLauncherActive(name: string): boolean {
@@ -102,20 +174,59 @@ export class Orchestrator {
     return 'starting';
   }
 
-  stop(name: string): void {
+  async stop(name: string, options: StopOptions = {}): Promise<void> {
     const launcher = this.getLauncher(name);
     if (!this.process.isActive(launcher)) {
       return;
     }
 
-    this.logger?.log(`Stopping ${name}...`);
-    this.process.stop(launcher);
+    await this.withGpu(`stop ${name}`, usesGpu(launcher), options, () => this.stopLauncher(launcher));
   }
 
-  stopAll(): void {
-    for (const launcher of this.launchers.values()) {
-      this.stop(launcher.name);
+  async stopAll(options: StopOptions = {}): Promise<void> {
+    const active = this.activeLaunchers();
+    if (active.length === 0) {
+      return;
     }
+
+    await this.withGpu('stop all', active.some(usesGpu), options, async () => {
+      for (const launcher of this.launchers.values()) {
+        await this.stopLauncher(launcher);
+      }
+    });
+  }
+
+  /**
+   * Waits for the GPU, logging who holds it meanwhile. The caller must `release()` the lease;
+   * prefer `withLease`, which does it.
+   */
+  async acquireLease(options: LeaseOptions): Promise<GpuLease> {
+    const waited = this.waitLogger();
+    const lease = await this.requireGpu().lock.acquire({ ...options, onWait: waited.onWait });
+    waited.acquired();
+    return lease;
+  }
+
+  /**
+   * Runs `fn` holding the GPU, then releases it. Inside `fn`, start/stop use this lease instead
+   * of taking their own, and a nested `withLease` reuses it.
+   */
+  async withLease<T>(options: LeaseOptions, fn: (lease: GpuLease) => Promise<T>): Promise<T> {
+    const waited = this.waitLogger();
+    return this.requireGpu().lock.withLease({ ...options, onWait: waited.onWait }, (lease) => {
+      waited.acquired();
+      return fn(lease);
+    });
+  }
+
+  /** Who holds the GPU and who waits; null without a GPU lock. */
+  leaseStatus(): GpuStatus | null {
+    return this.gpu?.lock.status() ?? null;
+  }
+
+  /** Breaks the current lease (`stack gpu release --force`) and returns it, or null if the GPU was free. */
+  breakLease(): LeaseInfo | null {
+    return this.requireGpu().lock.forceRelease();
   }
 
   async checkSMI(): Promise<string> {
@@ -127,12 +238,62 @@ export class Orchestrator {
     }
   }
 
+  private async stopLauncher(launcher: Launcher): Promise<void> {
+    if (!this.process.isActive(launcher)) {
+      return;
+    }
+
+    this.logger?.log(`Stopping ${launcher.name}...`);
+    await this.process.stop(launcher);
+  }
+
+  /** Runs `fn` under the caller's lease, the enclosing `withLease`, or a lease taken for its duration. */
+  private async withGpu<T>(action: string, needed: boolean, options: StopOptions, fn: () => Promise<T>): Promise<T> {
+    const gpu = this.gpu;
+    if (!needed || options.force || gpu === undefined) {
+      return fn();
+    }
+
+    const lease = options.lease ?? gpu.lock.currentLease();
+    if (lease !== undefined) {
+      if (!lease.held) {
+        throw new GpuLeaseLostError(`GPU lease of ${lease.holder} is no longer held (released, or broken by another client)`);
+      }
+      return fn();
+    }
+
+    return this.withLease({ holder: `${gpu.holder}: ${action}`, signal: options.signal }, fn);
+  }
+
+  private requireGpu(): OrchestratorGpu {
+    if (this.gpu === undefined) {
+      throw new Error('No GPU lock configured');
+    }
+    return this.gpu;
+  }
+
+  /** Logs who holds the GPU while waiting, then how long the wait took. */
+  private waitLogger(): { onWait: (holder: LeaseInfo) => void; acquired: () => void } {
+    let waitingSince: number | undefined;
+    return {
+      onWait: (holder) => {
+        waitingSince ??= Date.now();
+        this.logger?.log(`GPU held by ${describeLease(holder)}, waiting...`);
+      },
+      acquired: () => {
+        if (waitingSince !== undefined) {
+          this.logger?.log(`GPU acquired after ${formatDuration(Date.now() - waitingSince)}.`);
+        }
+      },
+    };
+  }
+
   private activeLaunchers(): Launcher[] {
     return [...this.launchers.values()].filter((launcher) => this.process.isActive(launcher));
   }
 
   /** Waits for a freshly started process: health check if configured, otherwise a short survival check. */
-  private async waitForStartup(launcher: Launcher, started: StartedProcess): Promise<void> {
+  private async waitForStartup(launcher: Launcher, started: StartedProcess, signal?: AbortSignal): Promise<void> {
     let exit: ProcessExit | undefined;
     void started.exited.then((result) => {
       exit = result;
@@ -141,14 +302,17 @@ export class Orchestrator {
 
     try {
       if (launcher.health) {
-        await this.waitForHealth(launcher, isAlive);
+        await this.waitForHealth(launcher, isAlive, signal);
       } else {
-        await Bun.sleep(STARTUP_GRACE_MS);
+        await sleep(STARTUP_GRACE_MS, signal);
         if (!isAlive()) {
           throw new ProcessExitedError('Process exited right after start');
         }
       }
     } catch (err) {
+      if (signal?.aborted) {
+        throw err;
+      }
       if (!(err instanceof ProcessExitedError)) {
         throw new Error(this.withLogTail(launcher, err instanceof Error ? err.message : String(err)));
       }
@@ -158,14 +322,14 @@ export class Orchestrator {
     }
   }
 
-  private async waitForHealth(launcher: Launcher, isAlive: () => boolean): Promise<void> {
+  private async waitForHealth(launcher: Launcher, isAlive: () => boolean, signal?: AbortSignal): Promise<void> {
     const health = launcher.health;
     if (!health) {
       return;
     }
 
     this.logger?.log(`Waiting for ${launcher.name} to become healthy (${health.url})...`);
-    await this.healthChecker.waitUntilHealthy(health, isAlive);
+    await this.healthChecker.waitUntilHealthy(health, isAlive, signal);
     this.logger?.log(`${launcher.name} is healthy.`);
   }
 

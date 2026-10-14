@@ -30,7 +30,7 @@ cp stack-example.toml stack.toml
 Définissez `LLM_STACK_CONFIG` ou passez `-f /chemin/vers/stack.toml` pour utiliser un fichier différent. Sinon `stack` cherche `./stack.toml` puis `./stack.json`. Ces deux fichiers sont gitignorés pour que vos commandes et chemins locaux restent privés. Mettez `#:schema /chemin/vers/llm-stack-ts/stack.schema.json` en première ligne pour avoir l'autocomplétion (Taplo / Even Better TOML).
 
 ```toml
-vram_capacity_gb = 16
+vram_capacity_gb = 15   # carte de 16 Go, voir « Bail GPU »
 
 [vars]
 models = "/data/models"
@@ -66,7 +66,7 @@ health = { url = "http://127.0.0.1:${port}/system_stats" }
 
 | Clé | Défaut | Rôle |
 |---|---|---|
-| `vram_capacity_gb` | aucun contrôle | VRAM totale disponible pour les services `gpu` |
+| `vram_capacity_gb` | aucun contrôle | VRAM que les services `gpu` peuvent utiliser : la capacité de la carte moins une marge (voir « Bail GPU ») |
 | `vars` | — | Variables utilisables en `${nom}`. Une variable peut utiliser celles définies avant elle |
 | `[launchers.<nom>]` | — | Un service. Le nom accepte lettres, chiffres, `.`, `_` et `-` |
 | `extends` | — | Hérite de tout ce que déclare un autre launcher (voir plus bas) |
@@ -132,6 +132,18 @@ Le format JSON reste accepté, que les launchers soient écrits en tableau (avec
 - Un service **`gpu`** non exclusif (un petit reranker, par exemple) cohabite avec les autres tant que la somme des `vram_gb` actifs tient dans `vram_capacity_gb`.
 - Le budget est vérifié **avant** d'arrêter quoi que ce soit : un démarrage refusé laisse la stack intacte.
 
+### Bail GPU
+
+Plusieurs clients peuvent piloter la stack en même temps : le CLI, et des projets qui importent `Stack` (un éditeur de workflows, des scripts de génération...). Le **bail GPU** évite que l'un arrête le service qu'un autre est en train d'utiliser :
+
+- Un seul client tient le GPU à la fois. Les autres attendent leur tour, dans l'ordre d'arrivée, et le CLI affiche qui tient le GPU : `GPU held by flow_editor: run 42 (pid 1234) for 3m12s, waiting...`.
+- Démarrer ou arrêter un service `gpu` ou `exclusive` prend le bail le temps de l'opération, puis le rend. Pour garder un service le temps de s'en servir (démarrer ComfyUI, générer, passer au LLM), le client tient le bail plus longtemps avec `withLease` (voir « Usage en librairie »).
+- Un service déjà actif ne demande pas de bail pour `start`. Les services CPU (`gpu = false`, non `exclusive`) non plus.
+- `--force` (CLI) ou `{ force: true }` (librairie) passe outre, comme avant le bail.
+- Pas de démon : le bail repose sur des fichiers à côté des PID (`<tmpdir>/stack-llm/gpu/`). Un client qui meurt perd sa place, son bail ne bloque personne. Un client bloqué mais vivant, si : `stack gpu release --force` casse son bail (il n'est pas prévenu et continue comme s'il le tenait).
+
+Le bail ne coordonne que les clients de la stack. Le bureau (Xorg), le navigateur et les autres programmes prennent de la VRAM sans demander : environ 0,6 Go sur une carte de 16 Go avec un bureau et Firefox ouverts, davantage avec une vidéo ou du WebGL. Réglez donc `vram_capacity_gb` sous la capacité réelle de la carte (`15` pour 16 Go).
+
 ### Suivi des processus et logs
 
 `stack` mémorise le PID de chaque service qu'il lance (dans `<tmpdir>/stack-llm`) et le suit quoi qu'il exécute ensuite (un script `start.sh` qui fait `exec python ...` reste suivi). `stop` envoie le signal à tout le groupe de processus, donc les enfants d'un script ne restent pas orphelins.
@@ -154,6 +166,9 @@ stack restart <name...>     # stop puis start (accepte aussi --arg)
 stack show [name...]        # commande finale et réglages, après héritage et variables (accepte --arg)
 stack stop                  # arrête tous les services actifs
 stack stop <name...>        # arrête un ou plusieurs services
+stack start <name> --force  # n'attend pas le bail GPU (aussi sur restart et stop)
+stack gpu                   # qui tient le bail GPU, qui attend
+stack gpu release --force   # casse le bail d'un client bloqué
 stack logs <name>           # dernières lignes du log (-n 100, --follow / -F)
 stack validate              # vérifie la configuration : clés obsolètes, fichiers de modèles et chemins absents
 stack migrate               # convertit stack.json en stack.toml (-o fichier, --force)
@@ -189,8 +204,8 @@ console.log(stack.listSummary());
 await stack.start('llm_main');
 console.log(await stack.status('llm_main')); // "ready"
 console.log(stack.pid('llm_main'), stack.logFile('llm_main'));
-stack.stop('llm_main');
-stack.stopAll(); // arrête tous les services actifs
+await stack.stop('llm_main'); // rend la main une fois le processus terminé
+await stack.stopAll(); // arrête tous les services actifs
 
 // Démarrer sans attendre
 await stack.start('llm_main', { noWait: true });
@@ -205,6 +220,28 @@ const big = new Stack({ argOverrides: { llm_main: { 'ctx-size': 65536 } } });
 await stack.start('llm_main');
 await stack.start('llm_flash'); // arrête llm_main, démarre llm_flash
 ```
+
+Garder le GPU le temps d'un travail (voir « Bail GPU ») : aucun autre client ne peut démarrer ou arrêter un service GPU avant la fin de la fonction. Le libellé `holder` est libre, il est affiché aux autres clients qui attendent.
+
+```ts
+await stack.withLease({ holder: 'persona_helper: lot mei', signal }, async () => {
+  await stack.start('comfyui'); // utilise le bail en cours, n'attend pas
+  // ... génération ...
+  await stack.start('qwen-vision'); // arrête comfyui (exclusive), toujours sous le même bail
+}); // bail rendu ici, même en cas d'erreur ; les services restent actifs
+
+// Bail sur plusieurs appels séparés : on le passe explicitement
+const lease = await stack.acquire({ holder: 'flow_editor: exécution 42' });
+try {
+  await stack.start('comfyui', { lease });
+} finally {
+  lease.release();
+}
+
+console.log(stack.gpu()); // { holder, waiting }
+```
+
+`signal` (un `AbortSignal`) interrompt l'attente du bail, et `start` l'accepte aussi : annulé pendant le health check, il arrête le processus qu'il vient de lancer, mais ne touche pas à un service qui tournait déjà. `new Stack({ holder: 'mon_projet' })` préfixe le libellé des baux que `start`/`stop` prennent seuls (`mon_projet: start comfyui` ; par défaut, le nom du script). Si un autre client a cassé le bail (`stack gpu release --force`), les opérations qui l'utilisent échouent avec `GpuLeaseLostError`.
 
 Pour l'utiliser depuis un autre projet du dossier `/data/projects/` sans publier sur npm :
 

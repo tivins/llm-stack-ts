@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0 - 2026-10-14
+
+### Added
+
+- Bail GPU partagé entre tous les clients de la stack (CLI et projets qui importent `Stack`) : un seul détenteur à la fois, les autres attendent dans l'ordre d'arrivée et le journal indique qui tient le GPU. Sans démon : des fichiers dans `<tmpdir>/stack-llm/gpu/`, et un client qui meurt perd sa place.
+- Démarrer ou arrêter un service `gpu` ou `exclusive` prend le bail le temps de l'opération : un client n'arrête plus le service qu'un autre est en train d'utiliser, s'il tient le bail.
+- Librairie : `Stack.withLease()`, `Stack.acquire()`, `Stack.gpu()`, option `lease` de `start`/`stop`/`restart`, `StackOptions.holder`, `GpuLeaseLostError`. Classe `GpuLock` exportée.
+- `stack gpu` affiche le détenteur et la file ; `stack gpu release --force` casse le bail d'un client bloqué.
+- `--force` sur `start`, `run`, `restart` et `stop` : passe outre le bail.
+- `Stack.start()` et `Stack.restart()` acceptent un `signal` (`AbortSignal`) : il interrompt l'attente du bail ou du health check, et arrête le processus que l'appel venait de lancer.
+
+### Changed
+
+- `Stack.stop()`, `Stack.stopAll()` et `ProcessController.stop()` renvoient une `Promise` et n'attendent plus la fin du processus en bloquant (`Bun.sleepSync`) : les appelants doivent faire `await`.
+- `Orchestrator.ensureActive(name, options)` prend un objet (`wait`, `signal`, `lease`, `force`) au lieu du booléen `waitForHealth`. `Orchestrator.restart()` fait l'arrêt et le démarrage sous un seul bail.
+- `stack restart` ne laisse plus un autre client prendre le GPU entre l'arrêt et le démarrage.
+- `vram_capacity_gb` désigne la VRAM que la stack peut utiliser, pas la capacité de la carte : l'exemple passe à `15` pour une carte de 16 Go, pour laisser de la place au bureau et au navigateur.
+
 ## 0.5.0 - 2026-10-10
 
 ### Added

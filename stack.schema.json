@@ -9,7 +9,7 @@
     "vram_capacity_gb": {
       "type": "number",
       "exclusiveMinimum": 0,
-      "description": "Total VRAM available to gpu launchers. No budget check when omitted."
+      "description": "VRAM the gpu launchers may use: the card's total minus a margin for the desktop and the browser. No budget check when omitted."
     },
     "vram_capacity_in_gigabytes": { "type": "number", "exclusiveMinimum": 0, "deprecated": true },
     "vars": {
