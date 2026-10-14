@@ -9,6 +9,7 @@ import { formatLauncherList } from './listView';
 import { migrateStackConfig } from './migrate';
 import type { Orchestrator } from './Orchestrator';
 import { describeLease } from './GpuLock';
+import { ConsoleLogger } from './Logger';
 import { createOrchestrator, summarizeLauncher } from './Stack';
 
 const HELP = `Usage: stack [options] <action> [name...]
@@ -217,7 +218,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const orchestrator = createOrchestrator(config, { holder: 'stack' });
+  const orchestrator = createOrchestrator(config, { holder: 'stack', logger: new ConsoleLogger() });
   const force = values.force;
 
   switch (action) {

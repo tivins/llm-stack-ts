@@ -192,10 +192,12 @@ Dans un terminal, la dernière colonne est coupée à la largeur de la fenêtre 
 ## Usage en librairie
 
 ```ts
-import { Stack } from 'llm-stack-ts';
+import { ConsoleLogger, Stack } from 'llm-stack-ts';
 // ou, depuis un autre projet du dossier : import { Stack } from '../llm-stack-ts/src';
 
 const stack = new Stack(); // résout la config comme le CLI (option file, $LLM_STACK_CONFIG, ./stack.toml, ./stack.json)
+// Silencieuse par défaut ; pour afficher la progression comme le CLI :
+// const stack = new Stack({ logger: new ConsoleLogger() });
 
 // Liste
 console.log(stack.listSummary());

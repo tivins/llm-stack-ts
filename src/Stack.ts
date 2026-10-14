@@ -7,7 +7,6 @@ import { GpuLock } from './GpuLock';
 import type { GpuLease, GpuStatus } from './GpuLock';
 import type { Launcher } from './Launcher';
 import type { LauncherStatus } from './LauncherStatus';
-import { ConsoleLogger } from './Logger';
 import type { Logger } from './Logger';
 import { Orchestrator } from './Orchestrator';
 import type { LeaseOptions, StartOptions, StopOptions } from './Orchestrator';
@@ -18,6 +17,7 @@ export interface StackOptions {
   file?: string;
   /** Extra args per launcher name, merged over the configuration (same as `stack start <name> --arg ...`). */
   argOverrides?: Record<string, Args>;
+  /** Receives progress messages (starting, waiting for the GPU, healthy...). Silent when omitted; pass `new ConsoleLogger()` to print them. */
   logger?: Logger;
   /** Directory used for PID files. Defaults to <tmpdir>/stack-llm. */
   pidDir?: string;
@@ -96,10 +96,9 @@ export function defaultLogDir(): string {
 
 /** Builds an orchestrator wired to real processes, as used by both the CLI and `Stack`. */
 export function createOrchestrator(config: StackConfig, options: Omit<StackOptions, 'file' | 'argOverrides'> = {}): Orchestrator {
-  const logger = options.logger ?? new ConsoleLogger();
   const pidDir = options.pidDir ?? defaultPidDir();
-  const processManager = new ProcessManager(pidDir, logger, options.logDir ?? defaultLogDir());
-  const orchestrator = new Orchestrator(processManager, config.vramCapacityGb, logger, undefined, {
+  const processManager = new ProcessManager(pidDir, options.logger, options.logDir ?? defaultLogDir());
+  const orchestrator = new Orchestrator(processManager, config.vramCapacityGb, options.logger, undefined, {
     lock: new GpuLock(gpuLockDir(pidDir)),
     holder: options.holder ?? path.basename(process.argv[1] ?? 'bun'),
   });

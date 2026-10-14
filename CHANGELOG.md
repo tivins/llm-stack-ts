@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0 - 2026-10-14
+
+### Changed
+
+- `Stack` et `createOrchestrator()` n'écrivent plus dans la console par défaut : sans `StackOptions.logger`, la librairie est silencieuse. Passer `logger: new ConsoleLogger()` pour retrouver les messages. Le CLI les affiche toujours.
+
 ## 0.6.0 - 2026-10-14
 
 ### Added
