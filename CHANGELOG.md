@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.0 - 2026-10-21
+
+### Added
+
+- File de jobs avec priorités sur le bail GPU, sans démon : `priority` 0 (chat), 1 (demandé par l'utilisateur, par défaut) et 2 (fond). À priorité égale, les jobs qui veulent le launcher déjà chargé passent d'abord (option `launcher`), jusqu'à `max_batch` jobs d'affilée ou jusqu'à ce qu'un autre job attende depuis `switch_after_seconds`. Les jobs de priorité 2 attendent `idle_seconds` sans activité de priorité 0 ou 1. Réglages dans la nouvelle table `gpu_queue` de la config.
+- Options du bail (`Stack.withLease`, `Stack.acquire`, `GpuLock.acquire`) : `priority`, `launcher` (démarré sous le bail avant la fonction par `Stack`), `idleMs`, `maxWait` (abandon avec la nouvelle `GpuBusyError`, qui porte le détenteur et la file) et `onWait` pour l'appelant. `start`, `restart` et `stop` acceptent `priority`, `maxWait` et `onWait`.
+- `Stack.touch()` repousse les jobs de fond ; `Stack.cancel(id)` et `stack gpu cancel <id>` retirent un job qui attend.
+- CLI : `--priority` et `--max-wait` sur `start`, `run`, `restart` et `stop` ; `stack gpu` affiche la file dans l'ordre de passage, avec priorité, launcher, raison de l'attente et id.
+- `stack validate` et `stack list` signalent un `llama-server` en `gpu = false` qui met quand même des couches sur le GPU (pas de `n-gpu-layers = 0`) : cette VRAM n'est comptée nulle part. Aussi exporté : `cpuOffloadWarnings()`.
+
+### Changed
+
+- Les clients en attente passent dans l'ordre de la file et non plus seulement dans l'ordre d'arrivée. Sans `priority` ni `launcher`, rien ne change : tout le monde est en priorité 1, dans l'ordre d'arrivée.
+- `AcquireOptions.onWait` reçoit `(holder, position)` : `holder` peut être `null` (aucun détenteur, mais le job attend son tour ou le calme). `LeaseInfo` porte `priority`, `launcher` et, dans `GpuStatus.waiting`, `reason`.
+- L'exclusion mutuelle ne repose plus sur l'ordre de la boulangerie : le client élu marque son ticket puis vérifie que personne d'autre ne l'a fait, et recule sinon.
+
 ## 0.7.0 - 2026-10-14
 
 ### Changed

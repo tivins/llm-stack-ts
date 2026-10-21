@@ -1,6 +1,6 @@
 import { GpuLeaseLostError, InvalidLauncherError, ProcessExitedError } from './errors';
 import { describeLease, formatDuration } from './GpuLock';
-import type { GpuLease, GpuLock, GpuStatus, LeaseInfo } from './GpuLock';
+import type { GpuLease, GpuLock, GpuStatus, JobPriority, LeaseInfo, QueuePosition } from './GpuLock';
 import { HealthChecker } from './HealthChecker';
 import type { Launcher } from './Launcher';
 import type { LauncherStatus } from './LauncherStatus';
@@ -29,6 +29,12 @@ export interface StopOptions {
   force?: boolean;
   /** Stops waiting for the GPU lease. */
   signal?: AbortSignal;
+  /** Priority of the lease the call takes on its own (default 1). */
+  priority?: JobPriority;
+  /** Gives up waiting for the GPU lease after this long, with `GpuBusyError`. */
+  maxWait?: number;
+  /** Called while waiting for the GPU lease, each time the holder, the position or the reason changes. */
+  onWait?: (holder: LeaseInfo | null, me: QueuePosition) => void;
 }
 
 export interface StartOptions extends StopOptions {
@@ -44,8 +50,21 @@ export interface StartOptions extends StopOptions {
 export interface LeaseOptions {
   /** Free text shown to the other clients while they wait, and by `stack gpu`. */
   holder: string;
+  /** 0: interactive (chat), 1: asked by the user, 2: background. Default 1. */
+  priority?: JobPriority;
+  /**
+   * Launcher the job needs: started under the lease before the job runs, and used to run the
+   * jobs of the same launcher in a row.
+   */
+  launcher?: string;
+  /** Quiet time to wait for after the last P0/P1 activity (default: 60 s for P2, none otherwise). */
+  idleMs?: number;
+  /** Gives up after this long, with `GpuBusyError`. 0 = only if the GPU can be had at once. */
+  maxWait?: number;
   /** Leaves the queue. */
   signal?: AbortSignal;
+  /** Called while waiting, each time the holder, the position or the reason changes. */
+  onWait?: (holder: LeaseInfo | null, me: QueuePosition) => void;
 }
 
 export interface OrchestratorGpu {
@@ -98,7 +117,7 @@ export class Orchestrator {
       return;
     }
 
-    await this.withGpu(`start ${name}`, usesGpu(launcher), options, async () => {
+    await this.withGpu(`start ${name}`, usesGpu(launcher), { ...options, launcher: name }, async () => {
       // Another client may have started it while we waited for the GPU.
       if (this.process.isActive(launcher)) {
         if (wait && launcher.health) {
@@ -142,7 +161,7 @@ export class Orchestrator {
   /** Stop then start, under a single GPU lease: no other client can take the GPU in between. */
   async restart(name: string, options: StartOptions = {}): Promise<void> {
     const launcher = this.getLauncher(name);
-    await this.withGpu(`restart ${name}`, usesGpu(launcher), options, async () => {
+    await this.withGpu(`restart ${name}`, usesGpu(launcher), { ...options, launcher: name }, async () => {
       await this.stopLauncher(launcher);
       await this.ensureActive(name, options);
     });
@@ -201,9 +220,15 @@ export class Orchestrator {
    * prefer `withLease`, which does it.
    */
   async acquireLease(options: LeaseOptions): Promise<GpuLease> {
-    const waited = this.waitLogger();
+    const waited = this.waitLogger(options.onWait);
     const lease = await this.requireGpu().lock.acquire({ ...options, onWait: waited.onWait });
     waited.acquired();
+    try {
+      await this.startJobLauncher(lease, options);
+    } catch (err) {
+      lease.release();
+      throw err;
+    }
     return lease;
   }
 
@@ -212,11 +237,22 @@ export class Orchestrator {
    * of taking their own, and a nested `withLease` reuses it.
    */
   async withLease<T>(options: LeaseOptions, fn: (lease: GpuLease) => Promise<T>): Promise<T> {
-    const waited = this.waitLogger();
-    return this.requireGpu().lock.withLease({ ...options, onWait: waited.onWait }, (lease) => {
+    const waited = this.waitLogger(options.onWait);
+    return this.requireGpu().lock.withLease({ ...options, onWait: waited.onWait }, async (lease) => {
       waited.acquired();
+      await this.startJobLauncher(lease, options);
       return fn(lease);
     });
+  }
+
+  /** Marks the GPU as in use: background (P2) jobs wait for their quiet time from now. */
+  touchGpu(): void {
+    this.requireGpu().lock.touch();
+  }
+
+  /** Removes a waiting client from the GPU queue (`stack gpu cancel <id>`); null if it was not waiting. */
+  cancelLeaseRequest(id: string): LeaseInfo | null {
+    return this.requireGpu().lock.cancel(id);
   }
 
   /** Who holds the GPU and who waits; null without a GPU lock. */
@@ -248,7 +284,12 @@ export class Orchestrator {
   }
 
   /** Runs `fn` under the caller's lease, the enclosing `withLease`, or a lease taken for its duration. */
-  private async withGpu<T>(action: string, needed: boolean, options: StopOptions, fn: () => Promise<T>): Promise<T> {
+  private async withGpu<T>(
+    action: string,
+    needed: boolean,
+    options: StopOptions & { launcher?: string },
+    fn: () => Promise<T>,
+  ): Promise<T> {
     const gpu = this.gpu;
     if (!needed || options.force || gpu === undefined) {
       return fn();
@@ -262,7 +303,12 @@ export class Orchestrator {
       return fn();
     }
 
-    return this.withLease({ holder: `${gpu.holder}: ${action}`, signal: options.signal }, fn);
+    const { signal, priority, maxWait, onWait, launcher } = options;
+    const waited = this.waitLogger(onWait);
+    return gpu.lock.withLease({ holder: `${gpu.holder}: ${action}`, signal, priority, maxWait, launcher, onWait: waited.onWait }, () => {
+      waited.acquired();
+      return fn();
+    });
   }
 
   private requireGpu(): OrchestratorGpu {
@@ -272,13 +318,25 @@ export class Orchestrator {
     return this.gpu;
   }
 
-  /** Logs who holds the GPU while waiting, then how long the wait took. */
-  private waitLogger(): { onWait: (holder: LeaseInfo) => void; acquired: () => void } {
+  /** Starts the launcher a job asked for, under its lease. */
+  private async startJobLauncher(lease: GpuLease, options: LeaseOptions): Promise<void> {
+    if (options.launcher !== undefined) {
+      await this.ensureActive(options.launcher, { lease, signal: options.signal });
+    }
+  }
+
+  /** Logs who holds the GPU while waiting, then how long the wait took; forwards to the caller's `onWait`. */
+  private waitLogger(callerOnWait?: LeaseOptions['onWait']): {
+    onWait: (holder: LeaseInfo | null, me: QueuePosition) => void;
+    acquired: () => void;
+  } {
     let waitingSince: number | undefined;
     return {
-      onWait: (holder) => {
+      onWait: (holder, me) => {
         waitingSince ??= Date.now();
-        this.logger?.log(`GPU held by ${describeLease(holder)}, waiting...`);
+        const why = me.reason === 'idle' ? ' (waiting for the GPU to be idle)' : me.position > 0 ? ` (${me.position} ahead)` : '';
+        this.logger?.log(`${holder === null ? 'GPU busy' : `GPU held by ${describeLease(holder)}`}, waiting${why}...`);
+        callerOnWait?.(holder, me);
       },
       acquired: () => {
         if (waitingSince !== undefined) {

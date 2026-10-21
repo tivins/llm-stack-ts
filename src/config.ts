@@ -16,8 +16,19 @@ export interface ConfigWarning {
 export interface StackConfig {
   /** Total VRAM available to `gpu` launchers; no budget check when unset. */
   readonly vramCapacityGb?: number;
+  /** Settings of the GPU job queue (`gpu_queue`); defaults apply to what is unset. */
+  readonly gpuQueue?: GpuQueueConfig;
   readonly launchers: Launcher[];
   readonly warnings: ConfigWarning[];
+}
+
+export interface GpuQueueConfig {
+  /** Quiet time of P2 jobs after the last P0/P1 activity. */
+  readonly idleMs?: number;
+  /** A job waiting this long for another launcher ends the current batch. */
+  readonly switchAfterMs?: number;
+  /** Jobs run in a row for the same launcher before the others get their turn. */
+  readonly maxBatch?: number;
 }
 
 export interface LoadOptions {
@@ -36,7 +47,8 @@ const NAME_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 const VAR_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_-]*)\}/g;
 const KINDS: LauncherKind[] = ['command', 'llama-server'];
 
-const TOP_LEVEL_KEYS = ['$schema', 'vram_capacity_gb', 'vram_capacity_in_gigabytes', 'vars', 'launchers'];
+const TOP_LEVEL_KEYS = ['$schema', 'vram_capacity_gb', 'vram_capacity_in_gigabytes', 'gpu_queue', 'vars', 'launchers'];
+const GPU_QUEUE_KEYS = ['idle_seconds', 'switch_after_seconds', 'max_batch'];
 const LAUNCHER_KEYS = [
   'name',
   'extends',
@@ -492,6 +504,50 @@ function buildLauncher(
   };
 }
 
+function parseGpuQueue(raw: unknown, warnings: ConfigWarning[]): GpuQueueConfig {
+  if (raw === undefined) {
+    return {};
+  }
+  if (!isRecord(raw)) {
+    throw new StackConfigError('gpu_queue must be a table');
+  }
+  warnUnknownKeys(raw, GPU_QUEUE_KEYS, 'gpu_queue', warnings);
+  const seconds = (key: string) => {
+    const value = raw[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new StackConfigError(`gpu_queue ${key} must be a number >= 0`);
+    }
+    return value * 1000;
+  };
+  const maxBatch = raw.max_batch;
+  if (maxBatch !== undefined && (typeof maxBatch !== 'number' || !Number.isInteger(maxBatch) || maxBatch < 1)) {
+    throw new StackConfigError('gpu_queue max_batch must be an integer >= 1');
+  }
+  return { idleMs: seconds('idle_seconds'), switchAfterMs: seconds('switch_after_seconds'), maxBatch };
+}
+
+/**
+ * A llama-server launcher marked `gpu = false` still offloads its layers to the GPU unless
+ * `n-gpu-layers` is 0 (llama.cpp's default): that VRAM is then counted nowhere.
+ */
+export function cpuOffloadWarnings(launchers: readonly Launcher[]): ConfigWarning[] {
+  return launchers
+    .filter((launcher) => launcher.kind === 'llama-server' && !launcher.gpu && !cpuOnlyLayers(launcher.args))
+    .map((launcher) => ({
+      level: 'warning' as const,
+      message:
+        `launcher ${launcher.name} has gpu = false but llama-server still puts layers on the GPU, uncounted: ` +
+        `set n-gpu-layers = 0 to keep it on the CPU, or gpu = true, exclusive = false and its vram_gb`,
+    }));
+}
+
+/** Args are canonical here (`ngl` → `n-gpu-layers`, `dev` → `device`). */
+function cpuOnlyLayers(args: Readonly<Args> | undefined): boolean {
+  const layers = args?.['n-gpu-layers'];
+  return (layers !== undefined && layers !== false && Number(layers) === 0) || args?.device === 'none';
+}
+
 /** Builds the launchers from an already parsed stack file (JSON or TOML document). */
 export function parseStackConfig(parsed: unknown, source: string, options: LoadOptions = {}): StackConfig {
   if (!isRecord(parsed)) {
@@ -506,6 +562,7 @@ export function parseStackConfig(parsed: unknown, source: string, options: LoadO
     throw new StackConfigError(`stack file vram_capacity_gb must be a positive number: ${source}`);
   }
 
+  const gpuQueue = parseGpuQueue(parsed.gpu_queue, warnings);
   const vars = parseVars(parsed.vars, warnings);
   const entries = collectEntries(parsed.launchers, source);
 
@@ -533,7 +590,7 @@ export function parseStackConfig(parsed: unknown, source: string, options: LoadO
 
   // A parent's legacy key is reported once per child; keep each message once.
   const unique = [...new Map(warnings.map((w) => [`${w.level}:${w.message}`, w])).values()];
-  return { vramCapacityGb, launchers, warnings: unique };
+  return { vramCapacityGb, gpuQueue, launchers, warnings: unique };
 }
 
 /** Reads a stack file as TOML (`.toml`) or JSON (anything else). */

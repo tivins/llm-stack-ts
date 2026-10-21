@@ -131,16 +131,35 @@ Le format JSON reste accepté, que les launchers soient écrits en tableau (avec
 - Un service **`exclusive`** arrête les autres services `exclusive` en cours avant de démarrer (typiquement : les gros modèles, ComfyUI).
 - Un service **`gpu`** non exclusif (un petit reranker, par exemple) cohabite avec les autres tant que la somme des `vram_gb` actifs tient dans `vram_capacity_gb`.
 - Le budget est vérifié **avant** d'arrêter quoi que ce soit : un démarrage refusé laisse la stack intacte.
+- Un `llama-server` en `gpu = false` met quand même ses couches sur le GPU si `n-gpu-layers` n'est pas à `0` (réglage par défaut de llama.cpp), et cette VRAM n'est comptée nulle part. `stack validate` et `stack list` le signalent : mettez `n-gpu-layers = 0` pour rester sur le CPU, ou `gpu = true`, `exclusive = false` et son `vram_gb` pour le compter.
 
 ### Bail GPU
 
 Plusieurs clients peuvent piloter la stack en même temps : le CLI, et des projets qui importent `Stack` (un éditeur de workflows, des scripts de génération...). Le **bail GPU** évite que l'un arrête le service qu'un autre est en train d'utiliser :
 
-- Un seul client tient le GPU à la fois. Les autres attendent leur tour, dans l'ordre d'arrivée, et le CLI affiche qui tient le GPU : `GPU held by flow_editor: run 42 (pid 1234) for 3m12s, waiting...`.
+- Un seul client tient le GPU à la fois. Les autres attendent leur tour dans une file (voir « File de jobs »), et le CLI affiche qui tient le GPU : `GPU held by flow_editor: run 42 (pid 1234) for 3m12s, waiting...`.
 - Démarrer ou arrêter un service `gpu` ou `exclusive` prend le bail le temps de l'opération, puis le rend. Pour garder un service le temps de s'en servir (démarrer ComfyUI, générer, passer au LLM), le client tient le bail plus longtemps avec `withLease` (voir « Usage en librairie »).
 - Un service déjà actif ne demande pas de bail pour `start`. Les services CPU (`gpu = false`, non `exclusive`) non plus.
 - `--force` (CLI) ou `{ force: true }` (librairie) passe outre, comme avant le bail.
 - Pas de démon : le bail repose sur des fichiers à côté des PID (`<tmpdir>/stack-llm/gpu/`). Un client qui meurt perd sa place, son bail ne bloque personne. Un client bloqué mais vivant, si : `stack gpu release --force` casse son bail (il n'est pas prévenu et continue comme s'il le tenait).
+
+### File de jobs
+
+Chaque demande de bail est un job de la file, avec une **priorité** : `0` pour l'interactif (le chat), `1` pour ce que l'utilisateur vient de demander (une image ; c'est la valeur par défaut, y compris pour le CLI), `2` pour les tâches de fond. Le GPU revient :
+
+1. à la priorité la plus haute, sans interrompre le job en cours : un message de chat attend la fin d'une image déjà lancée ;
+2. à priorité égale, aux jobs qui veulent le **launcher déjà chargé** (`launcher`), même arrivés après, pour ne recharger un modèle qu'une fois. Ce regroupement s'arrête après `max_batch` jobs d'affilée (8), ou dès qu'un job pour un autre launcher attend depuis `switch_after_seconds` (2 min) ;
+3. puis dans l'ordre d'arrivée.
+
+Un job de priorité 2 attend en plus que le GPU soit **calme** : `idle_seconds` (60 s) sans job de priorité 0 ou 1, ni appel à `touch()` (l'application signale par exemple que l'utilisateur tape). Il ne passe jamais devant un job de priorité 0 ou 1, même un qui attend.
+
+```toml
+gpu_queue = { idle_seconds = 60, switch_after_seconds = 120, max_batch = 8 }
+```
+
+`stack gpu` affiche la file dans l'ordre où les jobs passeront, avec leur priorité, leur launcher, ce qu'ils attendent et leur id ; `stack gpu cancel <id>` retire un job qui attend (son attente échoue avec `GpuLeaseLostError`).
+
+Comme le bail, la file n'a pas de démon : chaque client relit les tickets du dossier et calcule le même ordre. Elle ne vit que tant que les clients attendent : un job dont le processus meurt est retiré, et ce qu'il avait démarré reste actif. C'est à l'application de garder ses jobs (une table en base, par exemple) et de les redéposer après un redémarrage.
 
 Le bail ne coordonne que les clients de la stack. Le bureau (Xorg), le navigateur et les autres programmes prennent de la VRAM sans demander : environ 0,6 Go sur une carte de 16 Go avec un bureau et Firefox ouverts, davantage avec une vidéo ou du WebGL. Réglez donc `vram_capacity_gb` sous la capacité réelle de la carte (`15` pour 16 Go).
 
@@ -167,10 +186,12 @@ stack show [name...]        # commande finale et réglages, après héritage et 
 stack stop                  # arrête tous les services actifs
 stack stop <name...>        # arrête un ou plusieurs services
 stack start <name> --force  # n'attend pas le bail GPU (aussi sur restart et stop)
-stack gpu                   # qui tient le bail GPU, qui attend
+stack start <name> --priority 0 --max-wait 30   # priorité dans la file, abandon après 30 s (aussi sur restart et stop)
+stack gpu                   # qui tient le bail GPU, la file dans l'ordre de passage
+stack gpu cancel <id>       # retire un job de la file
 stack gpu release --force   # casse le bail d'un client bloqué
 stack logs <name>           # dernières lignes du log (-n 100, --follow / -F)
-stack validate              # vérifie la configuration : clés obsolètes, fichiers de modèles et chemins absents
+stack validate              # vérifie la configuration : clés obsolètes, fichiers de modèles et chemins absents, llama-server en gpu = false qui utilise le GPU
 stack migrate               # convertit stack.json en stack.toml (-o fichier, --force)
 ```
 
@@ -242,6 +263,41 @@ try {
 
 console.log(stack.gpu()); // { holder, waiting }
 ```
+
+Passer par la file (voir « File de jobs ») : `launcher` est démarré sous le bail avant la fonction, `maxWait` abandonne avec `GpuBusyError` (qui porte `status.holder`), et `onWait` dit qui tient le GPU et où en est le job.
+
+```ts
+import { GpuBusyError } from 'llm-stack-ts';
+
+// Une réponse du chat : priorité 0, le modèle reste chargé pour les suivantes
+await stack.withLease({ holder: 'chat: reply 12', priority: 0, launcher: 'qwen-32k-chat' }, async () => {
+  // ... requêtes à llama-server ...
+});
+
+// Une tâche de fond : passe après le chat et attend que le GPU soit calme
+try {
+  await stack.withLease(
+    {
+      holder: 'chat: summary 7',
+      priority: 2,
+      launcher: 'qwen-32k-chat',
+      maxWait: 10 * 60_000,
+      onWait: (holder, me) => console.log(holder?.holder ?? 'GPU busy', me.position, me.reason), // 'turn' | 'priority' | 'batch' | 'idle'
+    },
+    async () => {
+      /* ... */
+    },
+  );
+} catch (err) {
+  if (err instanceof GpuBusyError) console.log(`occupé par ${err.status.holder?.holder}, on réessaiera`);
+  else throw err;
+}
+
+stack.touch(); // l'utilisateur est actif : les jobs de priorité 2 attendent encore idle_seconds
+stack.cancel(id); // retire un job qui attend (id donné par stack.gpu().waiting)
+```
+
+`start`, `restart` et `stop` acceptent aussi `priority`, `maxWait` et `onWait` pour le bail qu'ils prennent seuls.
 
 `signal` (un `AbortSignal`) interrompt l'attente du bail, et `start` l'accepte aussi : annulé pendant le health check, il arrête le processus qu'il vient de lancer, mais ne touche pas à un service qui tournait déjà. `new Stack({ holder: 'mon_projet' })` préfixe le libellé des baux que `start`/`stop` prennent seuls (`mon_projet: start comfyui` ; par défaut, le nom du script). Si un autre client a cassé le bail (`stack gpu release --force`), les opérations qui l'utilisent échouent avec `GpuLeaseLostError`.
 

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import { findMissingPaths, loadStackConfig } from '../src/config';
+import { cpuOffloadWarnings, findMissingPaths, loadStackConfig } from '../src/config';
 import type { Launcher } from '../src/Launcher';
 import { StackConfigError } from '../src/errors';
 
@@ -292,5 +292,57 @@ args = { model = "/nonexistent/model.gguf", path = "${tmpdir()}" }
     const [launcher] = loadStackConfig(file).launchers;
 
     expect(findMissingPaths(launcher as Launcher)).toEqual(['/nonexistent/dir', '/nonexistent/model.gguf']);
+  });
+});
+
+describe('gpu_queue', () => {
+  test('reads the queue settings in seconds', () => {
+    const file = writeToml(`gpu_queue = { idle_seconds = 30, switch_after_seconds = 90, max_batch = 4 }
+[launchers.a]
+command = "true"
+`);
+
+    expect(loadStackConfig(file).gpuQueue).toEqual({ idleMs: 30_000, switchAfterMs: 90_000, maxBatch: 4 });
+  });
+
+  test('rejects a max_batch below 1', () => {
+    const file = writeToml(`gpu_queue = { max_batch = 0 }
+[launchers.a]
+command = "true"
+`);
+
+    expect(() => loadStackConfig(file)).toThrow('max_batch');
+  });
+});
+
+describe('cpuOffloadWarnings', () => {
+  test('flags llama-server launchers with gpu = false that still offload layers', () => {
+    const file = writeToml(`[launchers.offloads]
+kind = "llama-server"
+command = "llama-server"
+gpu = false
+args = { model = "m.gguf" }
+
+[launchers.cpu]
+kind = "llama-server"
+command = "llama-server"
+gpu = false
+args = { model = "m.gguf", ngl = 0 }
+
+[launchers.counted]
+kind = "llama-server"
+command = "llama-server"
+exclusive = false
+vram_gb = 1
+args = { model = "m.gguf", n-gpu-layers = 30 }
+
+[launchers.script]
+command = "./run.sh"
+gpu = false
+`);
+
+    const warnings = cpuOffloadWarnings(loadStackConfig(file).launchers);
+
+    expect(warnings.map((warning) => warning.message.split(' ')[1])).toEqual(['offloads']);
   });
 });

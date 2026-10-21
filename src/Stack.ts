@@ -4,7 +4,7 @@ import type { Args } from './args';
 import { loadStackConfig, resolveStackFile } from './config';
 import type { ConfigWarning, StackConfig } from './config';
 import { GpuLock } from './GpuLock';
-import type { GpuLease, GpuStatus } from './GpuLock';
+import type { GpuLease, GpuStatus, LeaseInfo } from './GpuLock';
 import type { Launcher } from './Launcher';
 import type { LauncherStatus } from './LauncherStatus';
 import type { Logger } from './Logger';
@@ -99,7 +99,7 @@ export function createOrchestrator(config: StackConfig, options: Omit<StackOptio
   const pidDir = options.pidDir ?? defaultPidDir();
   const processManager = new ProcessManager(pidDir, options.logger, options.logDir ?? defaultLogDir());
   const orchestrator = new Orchestrator(processManager, config.vramCapacityGb, options.logger, undefined, {
-    lock: new GpuLock(gpuLockDir(pidDir)),
+    lock: new GpuLock(gpuLockDir(pidDir), config.gpuQueue),
     holder: options.holder ?? path.basename(process.argv[1] ?? 'bun'),
   });
   for (const launcher of config.launchers) {
@@ -160,6 +160,8 @@ export class Stack {
   /**
    * Runs `fn` holding the GPU lease, then releases it, even on error. No other client of the
    * stack can start or stop a GPU service meanwhile; start/stop inside `fn` use this lease.
+   * The lease is a job in the GPU queue: `priority` (0 chat, 1 asked by the user, 2 background),
+   * `launcher` (started before `fn`, and jobs for the loaded launcher run in a row), `maxWait`.
    */
   async withLease<T>(options: LeaseOptions, fn: (lease: GpuLease) => Promise<T>): Promise<T> {
     return this.orchestrator.withLease(options, fn);
@@ -170,9 +172,19 @@ export class Stack {
     return this.orchestrator.acquireLease(options);
   }
 
-  /** Who holds the GPU lease, and who waits for it. */
+  /** Who holds the GPU lease, and who waits for it, in the order they will get it. */
   gpu(): GpuStatus {
     return this.orchestrator.leaseStatus() ?? { holder: null, waiting: [] };
+  }
+
+  /** Marks the GPU as in use (e.g. the user is typing): background (P2) jobs wait for their quiet time from now. */
+  touch(): void {
+    this.orchestrator.touchGpu();
+  }
+
+  /** Removes a waiting job from the GPU queue, from any process: its `acquire` rejects with `GpuLeaseLostError`. */
+  cancel(id: string): LeaseInfo | null {
+    return this.orchestrator.cancelLeaseRequest(id);
   }
 
   async status(name: string): Promise<LauncherStatus> {

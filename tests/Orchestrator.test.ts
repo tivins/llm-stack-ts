@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { GpuLeaseLostError, InvalidLauncherError } from '../src/errors';
+import { GpuBusyError, GpuLeaseLostError, InvalidLauncherError } from '../src/errors';
 import { GpuLock } from '../src/GpuLock';
 import type { Launcher } from '../src/Launcher';
 import { Orchestrator } from '../src/Orchestrator';
@@ -280,6 +280,38 @@ describe('Orchestrator with a GPU lease', () => {
     expect(process.startCalls).toEqual(['gpu', 'other', 'other']);
     expect(process.stopCalls).toEqual(['gpu', 'other']);
     expect(lock.status().holder).toBeNull();
+  });
+
+  test('a job with a launcher starts it under the lease before running', async () => {
+    const { process, orchestrator, lock } = withGpu();
+
+    const result = await orchestrator.withLease({ holder: 'chat', priority: 0, launcher: 'gpu' }, async () => {
+      expect(process.startCalls).toEqual(['gpu']);
+      expect(lock.status().holder?.priority).toBe(0);
+      expect(lock.status().holder?.launcher).toBe('gpu');
+      return 'reply';
+    });
+
+    expect(result).toBe('reply');
+    expect(lock.status().holder).toBeNull();
+  });
+
+  test('start forwards priority, maxWait and onWait to the lease it takes', async () => {
+    const { process, orchestrator, lock } = withGpu();
+    const other = await lock.acquire({ holder: 'comfyui batch' });
+    const seen: (string | undefined)[] = [];
+
+    const starting = orchestrator.ensureActive('gpu', {
+      wait: false,
+      priority: 0,
+      maxWait: 60,
+      onWait: (holder) => seen.push(holder?.holder),
+    });
+
+    await expect(starting).rejects.toThrow(GpuBusyError);
+    expect(seen).toEqual(['comfyui batch']);
+    expect(process.startCalls).toEqual([]);
+    other.release();
   });
 
   test('an explicit lease is used across calls, and refused once broken', async () => {

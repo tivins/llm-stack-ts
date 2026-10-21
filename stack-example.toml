@@ -4,6 +4,11 @@
 # browser (here, a 16 GB card).
 vram_capacity_gb = 15
 
+# GPU job queue (defaults shown): background jobs (priority 2) wait for 60 s without
+# chat or user jobs; jobs for the loaded launcher run in a row, up to 8, unless another
+# job has waited 2 min.
+# gpu_queue = { idle_seconds = 60, switch_after_seconds = 120, max_batch = 8 }
+
 # Usable as ${name} in commands, args, cwd, env and health urls.
 [vars]
 models = "/opt/models"

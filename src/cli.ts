@@ -4,11 +4,12 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { shellQuote, tokenize } from './args';
 import type { Args } from './args';
-import { findMissingPaths, loadStackConfig, readStackFile, resolveStackFile } from './config';
+import { cpuOffloadWarnings, findMissingPaths, loadStackConfig, readStackFile, resolveStackFile } from './config';
 import { formatLauncherList } from './listView';
 import { migrateStackConfig } from './migrate';
 import type { Orchestrator } from './Orchestrator';
 import { describeLease } from './GpuLock';
+import type { JobPriority, LeaseInfo } from './GpuLock';
 import { ConsoleLogger } from './Logger';
 import { createOrchestrator, summarizeLauncher } from './Stack';
 
@@ -26,16 +27,21 @@ Actions:
                      --arg key[=value]  Override an arg for this run (repeatable, e.g. --arg ctx-size=65536;
                                         key=false removes an inherited flag)
                      --force            Do not wait while another client holds the GPU lease
-  restart <name...>  Stop then start one or more services (accepts --no-wait, --arg and --force)
+                     --priority <0|1|2> Priority in the GPU queue (default: 1)
+                     --max-wait <s>     Give up if the GPU lease is not granted within <s> seconds
+  restart <name...>  Stop then start one or more services (accepts --no-wait, --arg, --force, --priority, --max-wait)
   show [name...]     Print the resolved command line and settings (accepts --arg)
-  stop [name...]     Stop one or more services, or every active service if none is given (accepts --force)
-  gpu                Show who holds the GPU lease and who waits for it
+  stop [name...]     Stop one or more services, or every active service if none is given
+                     (accepts --force, --priority, --max-wait)
+  gpu                Show who holds the GPU lease and the queue, in the order clients will get it
+  gpu cancel <id>    Remove a waiting client from the queue (its wait fails)
   gpu release --force
                      Break the current lease (its holder is not told and keeps running)
   logs <name>        Print the end of a service's log
                      -n, --lines <n>  Number of lines (default: 50)
                      -F, --follow     Keep printing new lines
-  validate           Check the configuration file: deprecated keys, missing model files and paths
+  validate           Check the configuration file: deprecated keys, missing model files and paths,
+                     llama-server launchers with gpu = false that still use the GPU
   migrate            Convert a legacy stack.json to stack.toml (extends, args, vars)
                      -o, --output <path>  Output file (default: same name with .toml, - for stdout)
                      --force              Overwrite the output file
@@ -59,6 +65,33 @@ function fail(message: string, withUsage = false): never {
     process.stderr.write(HELP);
   }
   process.exit(1);
+}
+
+const REASONS: Record<string, string> = {
+  turn: 'its turn',
+  priority: 'a higher priority',
+  batch: 'jobs for the loaded launcher',
+  idle: 'the GPU to be idle',
+};
+
+/** `[P1 comfyui] flow_editor: run 42 (pid 1234) for 3m12s`, plus the id and the reason for waiting ones. */
+function describeJob(lease: LeaseInfo): string {
+  const tag = `[P${lease.priority}${lease.launcher ? ` ${lease.launcher}` : ''}]`;
+  const waiting = lease.acquiredAt === undefined ? `, waits for ${REASONS[lease.reason ?? 'turn']} (id ${lease.id})` : '';
+  return `${tag} ${describeLease(lease)}${waiting}`;
+}
+
+function parsePriority(raw: string | undefined): JobPriority | undefined {
+  if (raw === undefined) return undefined;
+  if (!['0', '1', '2'].includes(raw)) fail(`--priority must be 0, 1 or 2, got '${raw}'`);
+  return Number(raw) as JobPriority;
+}
+
+function parseMaxWait(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const seconds = Number(raw);
+  if (raw.trim() === '' || !Number.isFinite(seconds) || seconds < 0) fail(`--max-wait must be a number of seconds >= 0, got '${raw}'`);
+  return seconds * 1000;
 }
 
 function formatTable(rows: string[][]): string {
@@ -176,6 +209,8 @@ async function main(): Promise<void> {
       arg: { type: 'string', multiple: true },
       output: { type: 'string', short: 'o' },
       force: { type: 'boolean', default: false },
+      priority: { type: 'string' },
+      'max-wait': { type: 'string' },
       quiet: { type: 'boolean', short: 'q', default: false },
       lines: { type: 'string', short: 'n' },
       follow: { type: 'boolean', short: 'F', default: false },
@@ -220,12 +255,17 @@ async function main(): Promise<void> {
 
   const orchestrator = createOrchestrator(config, { holder: 'stack', logger: new ConsoleLogger() });
   const force = values.force;
+  const priority = parsePriority(values.priority);
+  const maxWait = parseMaxWait(values['max-wait']);
 
   switch (action) {
     case 'list': {
       if (values.quiet) {
         console.log(orchestrator.getLaunchers().map((l) => l.name).join('\n'));
         return;
+      }
+      for (const warning of cpuOffloadWarnings(orchestrator.getLaunchers())) {
+        process.stderr.write(`Warning: ${warning.message}\n`);
       }
       const tty = process.stdout.isTTY === true;
       console.log(
@@ -255,7 +295,7 @@ async function main(): Promise<void> {
         if (overrides !== undefined && orchestrator.isLauncherActive(n)) {
           process.stderr.write(`Warning: ${n} is already running, use \`stack restart\` to apply --arg\n`);
         }
-        await orchestrator.ensureActive(n, { wait: !values['no-wait'], force });
+        await orchestrator.ensureActive(n, { wait: !values['no-wait'], force, priority, maxWait });
       }
       return;
     }
@@ -271,7 +311,7 @@ async function main(): Promise<void> {
       if (names.length === 0) fail('missing service name', true);
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
-        await orchestrator.restart(n, { wait: !values['no-wait'], force });
+        await orchestrator.restart(n, { wait: !values['no-wait'], force, priority, maxWait });
       }
       return;
     }
@@ -288,12 +328,12 @@ async function main(): Promise<void> {
 
     case 'stop': {
       if (names.length === 0) {
-        await orchestrator.stopAll({ force });
+        await orchestrator.stopAll({ force, priority, maxWait });
         return;
       }
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
-        await orchestrator.stop(n, { force });
+        await orchestrator.stop(n, { force, priority, maxWait });
       }
       return;
     }
@@ -305,11 +345,19 @@ async function main(): Promise<void> {
         console.log(broken === null ? 'GPU: free, nothing to release' : `Released the lease of ${describeLease(broken)}`);
         return;
       }
+      if (name === 'cancel') {
+        const id = names[1];
+        if (id === undefined) fail('missing id (shown by `stack gpu`)', true);
+        const cancelled = orchestrator.cancelLeaseRequest(id);
+        if (cancelled === null) fail(`no waiting client with id ${id}`);
+        console.log(`Cancelled ${describeJob(cancelled)}`);
+        return;
+      }
       if (name !== undefined) fail(`unknown gpu action '${name}'`, true);
       const status = orchestrator.leaseStatus();
-      console.log(status?.holder ? `GPU: held by ${describeLease(status.holder)}` : 'GPU: free');
+      console.log(status?.holder ? `GPU: held by ${describeJob(status.holder)}` : 'GPU: free');
       if (status && status.waiting.length > 0) {
-        console.log(`Waiting:\n${status.waiting.map((lease) => `  ${describeLease(lease)}`).join('\n')}`);
+        console.log(`Waiting:\n${status.waiting.map((lease) => `  ${describeJob(lease)}`).join('\n')}`);
       }
       return;
     }
@@ -329,6 +377,9 @@ async function main(): Promise<void> {
     }
 
     case 'validate': {
+      for (const warning of cpuOffloadWarnings(orchestrator.getLaunchers())) {
+        process.stderr.write(`Warning: ${warning.message}\n`);
+      }
       let missingCount = 0;
       for (const launcher of orchestrator.getLaunchers()) {
         for (const missing of findMissingPaths(launcher)) {

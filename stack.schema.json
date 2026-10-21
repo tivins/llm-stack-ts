@@ -12,6 +12,16 @@
       "description": "VRAM the gpu launchers may use: the card's total minus a margin for the desktop and the browser. No budget check when omitted."
     },
     "vram_capacity_in_gigabytes": { "type": "number", "exclusiveMinimum": 0, "deprecated": true },
+    "gpu_queue": {
+      "type": "object",
+      "description": "GPU job queue: jobs of priority 0 (chat), 1 (asked by the user) and 2 (background) wait for the GPU lease in that order.",
+      "additionalProperties": false,
+      "properties": {
+        "idle_seconds": { "type": "number", "minimum": 0, "default": 60, "description": "Quiet time a priority 2 job waits for, after the last priority 0/1 job." },
+        "switch_after_seconds": { "type": "number", "minimum": 0, "default": 120, "description": "Jobs for the launcher already loaded pass the others until one of them has waited this long." },
+        "max_batch": { "type": "integer", "minimum": 1, "default": 8, "description": "Jobs run in a row for the same launcher before the others get their turn." }
+      }
+    },
     "vars": {
       "type": "object",
       "additionalProperties": { "type": ["string", "number"] },

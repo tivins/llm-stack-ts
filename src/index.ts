@@ -1,8 +1,9 @@
 export { ConsoleLogger } from './Logger';
 export type { Logger } from './Logger';
-export { GpuLeaseLostError, InvalidLauncherError, ProcessExitedError, StackConfigError } from './errors';
+export { GpuBusyError, GpuLeaseLostError, InvalidLauncherError, ProcessExitedError, StackConfigError } from './errors';
 export { GpuLease, GpuLock, describeLease, formatDuration } from './GpuLock';
-export type { AcquireOptions, GpuStatus, LeaseInfo } from './GpuLock';
+export { DEFAULT_IDLE_MS, DEFAULT_MAX_BATCH, DEFAULT_SWITCH_AFTER_MS } from './GpuLock';
+export type { AcquireOptions, GpuLockOptions, GpuStatus, JobPriority, LeaseInfo, QueuePosition, WaitReason } from './GpuLock';
 export type { LauncherStatus } from './LauncherStatus';
 export type { LauncherHealth } from './LauncherHealth';
 export type { Launcher, LlmLauncher } from './Launcher';
@@ -11,8 +12,8 @@ export type { ProcessController, ProcessExit, StartedProcess } from './ProcessMa
 export { HealthChecker } from './HealthChecker';
 export { Orchestrator } from './Orchestrator';
 export type { LeaseOptions, OrchestratorGpu, StartOptions, StopOptions } from './Orchestrator';
-export { findMissingPaths, loadStackConfig, parseStackConfig, readStackFile, resolveStackFile } from './config';
-export type { ConfigWarning, LauncherKind, LoadOptions, StackConfig } from './config';
+export { cpuOffloadWarnings, findMissingPaths, loadStackConfig, parseStackConfig, readStackFile, resolveStackFile } from './config';
+export type { ConfigWarning, GpuQueueConfig, LauncherKind, LoadOptions, StackConfig } from './config';
 export type { ArgValue, Args } from './args';
 export { migrateStackConfig } from './migrate';
 export type { MigrateOptions, MigrationResult } from './migrate';
