@@ -140,6 +140,7 @@ Plusieurs clients peuvent piloter la stack en même temps : le CLI, et des proje
 - Un seul client tient le GPU à la fois. Les autres attendent leur tour dans une file (voir « File de jobs »), et le CLI affiche qui tient le GPU : `GPU held by flow_editor: run 42 (pid 1234) for 3m12s, waiting...`.
 - Démarrer ou arrêter un service `gpu` ou `exclusive` prend le bail le temps de l'opération, puis le rend. Pour garder un service le temps de s'en servir (démarrer ComfyUI, générer, passer au LLM), le client tient le bail plus longtemps avec `withLease` (voir « Usage en librairie »).
 - Un service déjà actif ne demande pas de bail pour `start`. Les services CPU (`gpu = false`, non `exclusive`) non plus.
+- Pour te servir d'un service à la main (l'interface web de llama.cpp, celle de ComfyUI), `stack start <name> --hold` garde le bail après le démarrage, jusqu'à Ctrl+C, en priorité 0 par défaut : les autres clients attendent dans la file au lieu de l'arrêter. Le service reste actif quand le bail est rendu. Le CLI rend aussi le bail si le service s'arrête, ou si quelqu'un casse le bail.
 - `--force` (CLI) ou `{ force: true }` (librairie) passe outre, comme avant le bail.
 - Pas de démon : le bail repose sur des fichiers à côté des PID (`<tmpdir>/stack-llm/gpu/`). Un client qui meurt perd sa place, son bail ne bloque personne. Un client bloqué mais vivant, si : `stack gpu release --force` casse son bail (il n'est pas prévenu et continue comme s'il le tenait).
 
@@ -187,6 +188,7 @@ stack stop                  # arrête tous les services actifs
 stack stop <name...>        # arrête un ou plusieurs services
 stack start <name> --force  # n'attend pas le bail GPU (aussi sur restart et stop)
 stack start <name> --priority 0 --max-wait 30   # priorité dans la file, abandon après 30 s (aussi sur restart et stop)
+stack start <name> --hold    # garde le bail GPU (P0) jusqu'à Ctrl+C, le service reste actif ensuite
 stack gpu                   # qui tient le bail GPU, la file dans l'ordre de passage
 stack gpu cancel <id>       # retire un job de la file
 stack gpu release --force   # casse le bail d'un client bloqué

@@ -29,6 +29,9 @@ Actions:
                      --force            Do not wait while another client holds the GPU lease
                      --priority <0|1|2> Priority in the GPU queue (default: 1)
                      --max-wait <s>     Give up if the GPU lease is not granted within <s> seconds
+                     --hold             Keep the GPU lease after the start, until Ctrl+C (priority 0 by
+                                        default): other clients wait instead of stopping the service.
+                                        The services stay active once the lease is released
   restart <name...>  Stop then start one or more services (accepts --no-wait, --arg, --force, --priority, --max-wait)
   show [name...]     Print the resolved command line and settings (accepts --arg)
   stop [name...]     Stop one or more services, or every active service if none is given
@@ -92,6 +95,70 @@ function parseMaxWait(raw: string | undefined): number | undefined {
   const seconds = Number(raw);
   if (raw.trim() === '' || !Number.isFinite(seconds) || seconds < 0) fail(`--max-wait must be a number of seconds >= 0, got '${raw}'`);
   return seconds * 1000;
+}
+
+const HOLD_POLL_MS = 2000;
+
+/**
+ * `stack start <name...> --hold`: starts the services under one GPU lease and keeps it until
+ * Ctrl+C, so other clients wait in the queue instead of stopping them. Also lets go when the
+ * lease is broken (`stack gpu release --force`) or when none of the services is running anymore.
+ * The services stay active once the lease is released.
+ */
+async function holdLease(
+  orchestrator: Orchestrator,
+  names: string[],
+  options: { wait: boolean; priority: JobPriority; maxWait: number | undefined; overrides: boolean },
+): Promise<void> {
+  const stopped = new AbortController();
+  const onSignal = () => stopped.abort();
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+  process.on('SIGHUP', onSignal);
+
+  let lease;
+  try {
+    lease = await orchestrator.acquireLease({
+      holder: `stack: hold ${names.join(', ')}`,
+      priority: options.priority,
+      maxWait: options.maxWait,
+      signal: stopped.signal,
+    });
+  } catch (err) {
+    if (!stopped.signal.aborted) throw err;
+    console.log('\nInterrupted while waiting for the GPU lease');
+    return;
+  }
+  try {
+    for (const n of names) {
+      if (options.overrides && orchestrator.isLauncherActive(n)) {
+        process.stderr.write(`Warning: ${n} is already running, use \`stack restart\` to apply --arg\n`);
+      }
+      await orchestrator.ensureActive(n, { lease, wait: options.wait, signal: stopped.signal });
+    }
+    console.log(`Holding the GPU lease for ${names.join(', ')} (P${options.priority}). Ctrl+C to release it; the services keep running.`);
+    while (!stopped.signal.aborted) {
+      await new Promise((resolve) => setTimeout(resolve, HOLD_POLL_MS));
+      if (!lease.held) {
+        process.stderr.write('GPU lease broken by another client, no longer holding it\n');
+        process.exitCode = 1;
+        return;
+      }
+      if (!names.some((n) => orchestrator.isLauncherActive(n))) {
+        console.log(`${names.join(', ')} no longer running, GPU lease released`);
+        return;
+      }
+    }
+    console.log('\nGPU lease released');
+  } catch (err) {
+    if (!stopped.signal.aborted) throw err;
+    console.log('\nInterrupted, GPU lease released');
+  } finally {
+    lease.release();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    process.off('SIGHUP', onSignal);
+  }
 }
 
 function formatTable(rows: string[][]): string {
@@ -209,6 +276,7 @@ async function main(): Promise<void> {
       arg: { type: 'string', multiple: true },
       output: { type: 'string', short: 'o' },
       force: { type: 'boolean', default: false },
+      hold: { type: 'boolean', default: false },
       priority: { type: 'string' },
       'max-wait': { type: 'string' },
       quiet: { type: 'boolean', short: 'q', default: false },
@@ -254,6 +322,9 @@ async function main(): Promise<void> {
   }
 
   const orchestrator = createOrchestrator(config, { holder: 'stack', logger: new ConsoleLogger() });
+  if (values.hold && action !== 'start' && action !== 'run') {
+    fail('--hold only applies to start and run');
+  }
   const force = values.force;
   const priority = parsePriority(values.priority);
   const maxWait = parseMaxWait(values['max-wait']);
@@ -291,6 +362,11 @@ async function main(): Promise<void> {
     case 'run': {
       if (names.length === 0) fail('missing service name', true);
       assertKnownLaunchers(orchestrator, names);
+      if (values.hold) {
+        if (force) fail('--hold takes the GPU lease, --force skips it: use one or the other');
+        await holdLease(orchestrator, names, { wait: !values['no-wait'], priority: priority ?? 0, maxWait, overrides: overrides !== undefined });
+        return;
+      }
       for (const n of names) {
         if (overrides !== undefined && orchestrator.isLauncherActive(n)) {
           process.stderr.write(`Warning: ${n} is already running, use \`stack restart\` to apply --arg\n`);

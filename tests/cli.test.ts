@@ -26,8 +26,8 @@ function writeConfig(): string {
   return file;
 }
 
-async function runCli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(['bun', CLI, ...args], { stdout: 'pipe', stderr: 'pipe' });
+async function runCli(args: string[], env?: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(['bun', CLI, ...args], { stdout: 'pipe', stderr: 'pipe', env: env && { ...process.env, ...env } });
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -111,4 +111,50 @@ describe('cli', () => {
     expect(result.code).toBe(1);
     expect(result.stderr).toContain('add --force');
   });
+
+  test('--hold is refused with --force and outside start/run', async () => {
+    const file = writeConfig();
+
+    const withForce = await runCli(['-f', file, 'start', 'llm_main', '--hold', '--force']);
+    const withStop = await runCli(['-f', file, 'stop', 'llm_main', '--hold']);
+
+    expect(withForce.code).toBe(1);
+    expect(withForce.stderr).toContain('use one or the other');
+    expect(withStop.code).toBe(1);
+    expect(withStop.stderr).toContain('--hold only applies to start and run');
+  });
+
+  test('start --hold keeps the GPU lease until SIGINT and leaves the service running', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'llm-stack-ts-cli-'));
+    const file = path.join(dir, 'stack.toml');
+    writeFileSync(file, 'vram_capacity_gb = 16\n[launchers.svc]\ncommand = "sleep 60"\nvram_gb = 1\n');
+    // os.tmpdir() follows TMPDIR: PID files and the GPU lease stay inside this test.
+    const env = { TMPDIR: dir, XDG_STATE_HOME: dir };
+
+    const hold = Bun.spawn(['bun', CLI, '-f', file, 'start', 'svc', '--hold'], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, ...env },
+    });
+    const reader = hold.stdout.getReader();
+    let out = '';
+    while (!out.includes('Holding the GPU lease')) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      out += new TextDecoder().decode(value);
+    }
+    expect(out).toContain('Holding the GPU lease for svc (P0)');
+
+    const during = await runCli(['-f', file, 'gpu'], env);
+    expect(during.stdout).toContain('GPU: held by [P0] stack: hold svc');
+
+    hold.kill('SIGINT');
+    expect(await hold.exited).toBe(0);
+
+    const after = await runCli(['-f', file, 'gpu'], env);
+    const status = await runCli(['-f', file, 'status', 'svc'], env);
+    await runCli(['-f', file, 'stop', 'svc'], env);
+    expect(after.stdout).toContain('GPU: free');
+    expect(status.stdout.trim()).toBe('ready');
+  }, 20000);
 });

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0 - 2026-11-06
+
+### Added
+
+- CLI : `stack start <name...> --hold` (et `run`) garde le bail GPU après le démarrage, jusqu'à Ctrl+C, en priorité 0 par défaut (`--priority` pour changer). Les autres clients (un worker en tâche de fond, par exemple) attendent dans la file au lieu d'arrêter un service qu'on utilise à la main. Le bail est rendu aussi quand plus aucun des services ne tourne, ou quand un autre client le casse ; les services restent actifs. Refusé avec `--force` et hors de `start`/`run`.
+
 ## 0.8.0 - 2026-10-21
 
 ### Added
