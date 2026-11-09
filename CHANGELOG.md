@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1 - 2026-11-09
+
+### Fixed
+
+- `ProcessExit.signal` reste un nom de signal (`SIGTERM`…) même quand Bun le donne sous forme de numéro : corrige le typecheck avec `@types/bun` 1.4 (`ProcessManager.ts`), vu depuis local_semantic_index.
+
 ## 0.9.0 - 2026-11-06
 
 ### Added

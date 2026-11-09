@@ -1,4 +1,5 @@
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { constants as osConstants } from 'node:os';
 import path from 'node:path';
 import type { Launcher } from './Launcher';
 import type { Logger } from './Logger';
@@ -97,7 +98,7 @@ export class ProcessManager implements ProcessController {
 
     this.writePidFile(launcher.name, { pid: proc.pid, startTime: this.readStat(proc.pid)?.startTime });
 
-    const exited = proc.exited.then(() => ({ code: proc.exitCode, signal: proc.signalCode }));
+    const exited = proc.exited.then(() => ({ code: proc.exitCode, signal: signalName(proc.signalCode) }));
     return { pid: proc.pid, exited };
   }
 
@@ -298,4 +299,11 @@ export class ProcessManager implements ProcessController {
     }
     return condition();
   }
+}
+
+/** Bun may report the exit signal as a number (`@types/bun` >= 1.4): normalize to its name. */
+function signalName(signal: string | number | null): string | null {
+  if (typeof signal !== 'number') return signal;
+  const entry = Object.entries(osConstants.signals).find(([, n]) => n === signal);
+  return entry ? entry[0] : String(signal);
 }
