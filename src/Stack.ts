@@ -86,9 +86,18 @@ export function summarizeLauncher(launcher: Launcher): Omit<LauncherSummary, 'ac
     model: typeof model === 'string' ? model : undefined,
     ctxSize: numeric('ctx-size'),
     reasoningBudget: numeric('reasoning-budget'),
-    port: launcher.port,
+    port: launcher.port ?? healthPort(launcher),
     url: serviceUrl(launcher),
   };
+}
+
+/** Port of the health check URL, for a launcher without `port` (ComfyUI started with its default port). */
+function healthPort(launcher: Launcher): number | undefined {
+  const url = launcher.health?.url;
+  if (url === undefined || !URL.canParse(url)) return undefined;
+  const parsed = new URL(url);
+  const port = parsed.port === '' ? (parsed.protocol === 'https:' ? 443 : 80) : Number(parsed.port);
+  return Number.isInteger(port) ? port : undefined;
 }
 
 /** Origin of the health check, else `http://127.0.0.1:<port>`. */

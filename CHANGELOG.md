@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1 - 2026-11-19
+
+### Fixed
+
+- `LauncherSummary.port` (et donc `url`, `stack list-json`) prend le port de l'URL du health check quand le launcher n'a pas de clé `port` : ComfyUI, lancé sur son port par défaut, avait un résumé sans port, et une machine distante n'ouvrait pas de tunnel vers lui.
+
 ## 0.11.0 - 2026-11-19
 
 ### Added

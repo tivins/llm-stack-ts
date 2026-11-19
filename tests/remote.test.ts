@@ -9,7 +9,7 @@ import { GpuLock } from '../src/GpuLock';
 import type { Launcher } from '../src/Launcher';
 import type { ProcessController, StartedProcess } from '../src/ProcessManager';
 import { RemoteHost } from '../src/RemoteHost';
-import { Stack } from '../src/Stack';
+import { Stack, summarizeLauncher } from '../src/Stack';
 
 const CLI = path.join(import.meta.dir, '../src/cli.ts');
 
@@ -154,6 +154,18 @@ describe('remote launchers: driven through the remote stack', () => {
       busy.release();
     }
   }, 30000);
+});
+
+describe('summarizeLauncher', () => {
+  test('a launcher without port takes the one of its health check', () => {
+    const config = parseStackConfig(
+      { launchers: { comfyui: { command: 'python main.py', health: { url: 'http://127.0.0.1:8188/system_stats' } }, cli: { command: 'x' } } },
+      'test',
+    );
+    const [comfyui, cli] = config.launchers.map(summarizeLauncher);
+    expect(comfyui).toMatchObject({ port: 8188, url: 'http://127.0.0.1:8188' });
+    expect(cli).toMatchObject({ port: undefined, url: undefined });
+  });
 });
 
 describe('RemoteHost', () => {
