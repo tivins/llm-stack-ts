@@ -32,6 +32,19 @@ export interface Launcher {
   readonly args?: Readonly<Args>;
   /** The subset of `args` declared by the launcher itself, i.e. what a variant changes. */
   readonly ownArgs?: Readonly<Args>;
+  /**
+   * Set when the service runs on another machine (`remote = "forge"`): `stack` drives it there
+   * over ssh, and its command, VRAM and health come from that machine's own stack file. Locally,
+   * such a launcher has no command, no VRAM and is never exclusive.
+   */
+  readonly remote?: LauncherRemote;
+}
+
+export interface LauncherRemote {
+  /** Name of the `[remotes.<name>]` table. */
+  readonly host: string;
+  /** Launcher name on the remote machine (`remote_name`, default: the same name). */
+  readonly name: string;
 }
 
 /** @deprecated Use `Launcher`. */

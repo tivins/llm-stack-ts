@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.0 - 2026-11-19
+
+### Added
+
+- Machines distantes : `[remotes.<nom>]` (`ssh`, `wake`, `wake_broadcast`, `wake_timeout_seconds`, `port_offset`, `tunnel`, `stack`, `command`) et launchers `remote = "<nom>"` (option `remote_name`), sans autre réglage : le modèle, la VRAM et l'exclusivité restent dans le `stack.toml` de la machine distante. `start`, `restart`, `stop`, `status`, `show` et `logs` y passent par `ssh <machine> stack … --json`.
+- Bail distant : `withLease({ launcher })` et `acquire({ launcher })` sur un launcher distant prennent le bail de cette machine avec `stack lease` (nouvelle `RemoteLease`, sous-classe de `GpuLease`) ; `start`/`stop` d'un service de la même machine passent sous ce bail. Libellé là-bas : `<machine d'ici>/<holder>`. Sans bail, un `start` distant prend un bail là-bas le temps du démarrage.
+- Tunnels ssh (`ssh -N -L`, suivis comme des services) ouverts par `start` vers `127.0.0.1:<port + port_offset>`, relancés s'ils ne répondent plus, fermés par `stack stop` sans nom.
+- Wake-on-LAN automatique d'une machine distante qui ne répond pas (start, restart, bail), puis `RemoteUnreachableError` si elle ne répond toujours pas. `status`, `list`, `stop` et `gpu` ne réveillent jamais.
+- `LauncherSummary.url` (URL de base du service : origine du health check ou `127.0.0.1:<port>`, ou bout du tunnel) et `LauncherSummary.host`. `describeLauncher()` donne ce résumé, valeurs distantes comprises.
+- `Stack.remoteGpu()` ; `stack gpu` affiche aussi la file de chaque machine distante. `stack gpu touch` ; `Stack.touch()` prévient aussi les machines distantes (au plus toutes les 10 s).
+- `stack list` (`@forge`), `stack status` (colonne HOST), `stack validate` (le launcher existe-t-il là-bas ?) connaissent les launchers distants. `--hold` fonctionne sur des services d'une même machine distante.
+- Schéma : `remotes`, `remote`, `remote_name`.
+
+### Changed
+
+- `stack stop` sans nom ferme aussi les tunnels ; il n'arrête jamais les services d'une machine distante.
+- `--json` écrit ses lignes de manière synchrone : la dernière (erreur, `released`) n'est plus perdue par la sortie du processus.
+
 ## 0.10.0 - 2026-11-19
 
 ### Added

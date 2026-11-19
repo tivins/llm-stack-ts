@@ -11,6 +11,7 @@ import type { Logger } from './Logger';
 import { Orchestrator } from './Orchestrator';
 import type { LeaseOptions, StartOptions, StopOptions } from './Orchestrator';
 import { ProcessManager } from './ProcessManager';
+import { RemoteHost } from './RemoteHost';
 
 export interface StackOptions {
   /** Explicit path to the stack file. Falls back to $LLM_STACK_CONFIG, then ./stack.toml, then ./stack.json. */
@@ -53,7 +54,16 @@ export interface LauncherSummary {
   readonly ctxSize?: number;
   /** `args.reasoning-budget` (-1 = unlimited). */
   readonly reasoningBudget?: number;
+  /** Local port: for a remote launcher, the end of the ssh tunnel (remote port + `port_offset`). */
   readonly port?: number;
+  /**
+   * Base URL of the service, to give to a client (`new LLM(summary.url)`): the origin of the
+   * health check, or `http://127.0.0.1:<port>`; for a remote launcher, the local end of the
+   * tunnel, opened by `start`. Undefined without a port (or a remote machine never reached).
+   */
+  readonly url?: string;
+  /** Name of the remote machine (`remote = "forge"`); undefined for a local launcher. */
+  readonly host?: string;
 }
 
 /** The fields of `LauncherSummary` taken from the launcher itself (everything but `active`). */
@@ -77,6 +87,47 @@ export function summarizeLauncher(launcher: Launcher): Omit<LauncherSummary, 'ac
     ctxSize: numeric('ctx-size'),
     reasoningBudget: numeric('reasoning-budget'),
     port: launcher.port,
+    url: serviceUrl(launcher),
+  };
+}
+
+/** Origin of the health check, else `http://127.0.0.1:<port>`. */
+function serviceUrl(launcher: Launcher): string | undefined {
+  if (launcher.health?.url) {
+    try {
+      return new URL(launcher.health.url).origin;
+    } catch {
+      // Not a URL we can use: fall back to the port.
+    }
+  }
+  return launcher.port === undefined ? undefined : `http://127.0.0.1:${launcher.port}`;
+}
+
+/**
+ * Summary of a launcher as seen from here: for a remote launcher, its model, VRAM and state
+ * come from the remote machine (never woken up; last known values if it does not answer),
+ * and `port` / `url` are the local end of the tunnel.
+ */
+export function describeLauncher(orchestrator: Orchestrator, launcher: Launcher): LauncherSummary {
+  const remote = orchestrator.remoteInfo(launcher.name);
+  if (remote === null) {
+    return { ...summarizeLauncher(launcher), active: orchestrator.isLauncherActive(launcher.name) };
+  }
+  const info = remote.info;
+  return {
+    name: launcher.name,
+    type: launcher.type || info?.type || '',
+    description: launcher.description || info?.description || '',
+    active: remote.fresh ? (info?.active ?? false) : false,
+    size: info?.size ?? 0,
+    gpu: info?.gpu ?? false,
+    exclusive: info?.exclusive ?? false,
+    model: info?.model,
+    ctxSize: info?.ctxSize,
+    reasoningBudget: info?.reasoningBudget,
+    port: remote.port,
+    url: remote.url,
+    host: remote.host.name,
   };
 }
 
@@ -105,6 +156,9 @@ export function createOrchestrator(config: StackConfig, options: Omit<StackOptio
   for (const launcher of config.launchers) {
     orchestrator.addLauncher(launcher);
   }
+  for (const remote of config.remotes) {
+    orchestrator.addRemote(new RemoteHost(remote, { pidDir, processes: processManager, logger: options.logger }));
+  }
   return orchestrator;
 }
 
@@ -131,7 +185,7 @@ export class Stack {
   listSummary(): Record<string, LauncherSummary> {
     const summary: Record<string, LauncherSummary> = {};
     for (const launcher of this.orchestrator.getLaunchers()) {
-      summary[launcher.name] = { ...summarizeLauncher(launcher), active: this.orchestrator.isLauncherActive(launcher.name) };
+      summary[launcher.name] = describeLauncher(this.orchestrator, launcher);
     }
     return summary;
   }
@@ -172,12 +226,20 @@ export class Stack {
     return this.orchestrator.acquireLease(options);
   }
 
-  /** Who holds the GPU lease, and who waits for it, in the order they will get it. */
+  /** Who holds the GPU lease, and who waits for it, in the order they will get it. Local GPU only: see `remoteGpu()`. */
   gpu(): GpuStatus {
     return this.orchestrator.leaseStatus() ?? { holder: null, waiting: [] };
   }
 
-  /** Marks the GPU as in use (e.g. the user is typing): background (P2) jobs wait for their quiet time from now. */
+  /** The GPU queue of each remote machine, by name (null when it does not answer; never wakes it). */
+  async remoteGpu(): Promise<Record<string, GpuStatus | null>> {
+    return this.orchestrator.remoteLeaseStatus();
+  }
+
+  /**
+   * Marks the GPU as in use (e.g. the user is typing): background (P2) jobs wait for their quiet
+   * time from now. Also on the remote machines, at most every 10 s, without waiting for them.
+   */
   touch(): void {
     this.orchestrator.touchGpu();
   }

@@ -122,6 +122,10 @@ function formatArg(key: string, value: ArgValue): string {
 function details(launcher: Launcher, view: ArgsView): string {
   const parts: string[] = [];
   if (launcher.gpu && !launcher.exclusive) parts.push('shared-gpu');
+  if (launcher.remote !== undefined) {
+    parts.push(`@${launcher.remote.host}${launcher.remote.name === launcher.name ? '' : `:${launcher.remote.name}`}`);
+    return parts.join(' ');
+  }
 
   const own = Object.entries(view.own).filter(([key]) => !COLUMN_ARGS.includes(key));
   parts.push(...own.map(([key, value]) => formatArg(key, value)));

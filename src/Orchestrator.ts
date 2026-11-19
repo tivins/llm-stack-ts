@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { GpuLeaseLostError, InvalidLauncherError, ProcessExitedError } from './errors';
 import { describeLease, formatDuration } from './GpuLock';
 import type { GpuLease, GpuLock, GpuStatus, JobPriority, LeaseInfo, QueuePosition } from './GpuLock';
@@ -7,6 +8,8 @@ import type { LauncherStatus } from './LauncherStatus';
 import type { Logger } from './Logger';
 import { readLastLines } from './logs';
 import type { ProcessController, ProcessExit, StartedProcess } from './ProcessManager';
+import { RemoteLease } from './RemoteHost';
+import type { RemoteHost, RemoteLauncherInfo } from './RemoteHost';
 import { sleep } from './sleep';
 
 /** How long a launcher without health check must survive after start to be considered started. */
@@ -74,6 +77,9 @@ export interface OrchestratorGpu {
 }
 
 export class Orchestrator {
+  private readonly remotes = new Map<string, RemoteHost>();
+  /** The remote lease of the enclosing `withLease`, used by start/stop on that machine. */
+  private readonly remoteLeaseContext = new AsyncLocalStorage<RemoteLease>();
   private readonly launchers = new Map<string, Launcher>();
   private readonly healthChecker: HealthChecker;
 
@@ -93,6 +99,30 @@ export class Orchestrator {
     this.launchers.set(launcher.name, launcher);
   }
 
+  /** A machine whose services are driven over ssh: the launchers with `remote = <its name>`. */
+  addRemote(host: RemoteHost): void {
+    this.remotes.set(host.name, host);
+  }
+
+  getRemotes(): RemoteHost[] {
+    return [...this.remotes.values()];
+  }
+
+  /**
+   * Where a remote launcher runs and how to reach it: its info on the remote machine (fresh if
+   * it answers, else the last one seen, never waking it), the local port and URL through the
+   * tunnel. Null for a local launcher.
+   */
+  remoteInfo(name: string): { host: RemoteHost; remoteName: string; info?: RemoteLauncherInfo; fresh: boolean; port?: number; url?: string } | null {
+    const launcher = this.getLauncher(name);
+    if (launcher.remote === undefined) return null;
+    const { host, remoteName } = this.remoteOf(launcher);
+    const fresh = host.launchersSync();
+    const info = (fresh ?? host.cachedLaunchers())?.[remoteName];
+    const port = info?.port === undefined ? undefined : host.localPort(info.port);
+    return { host, remoteName, info, fresh: fresh !== null, port, url: port === undefined ? undefined : `http://127.0.0.1:${port}` };
+  }
+
   getLaunchers(): Launcher[] {
     return [...this.launchers.values()];
   }
@@ -108,6 +138,9 @@ export class Orchestrator {
 
   async ensureActive(name: string, options: StartOptions = {}): Promise<void> {
     const launcher = this.getLauncher(name);
+    if (launcher.remote !== undefined) {
+      return this.remoteStart(launcher, options, false);
+    }
     const wait = options.wait ?? true;
 
     if (this.process.isActive(launcher)) {
@@ -161,26 +194,43 @@ export class Orchestrator {
   /** Stop then start, under a single GPU lease: no other client can take the GPU in between. */
   async restart(name: string, options: StartOptions = {}): Promise<void> {
     const launcher = this.getLauncher(name);
+    if (launcher.remote !== undefined) {
+      return this.remoteStart(launcher, options, true);
+    }
     await this.withGpu(`restart ${name}`, usesGpu(launcher), { ...options, launcher: name }, async () => {
       await this.stopLauncher(launcher);
       await this.ensureActive(name, options);
     });
   }
 
+  /** For a remote launcher, asks the remote machine (synchronously, never waking it; false if it does not answer). */
   isLauncherActive(name: string): boolean {
-    return this.process.isActive(this.getLauncher(name));
+    const launcher = this.getLauncher(name);
+    if (launcher.remote !== undefined) {
+      const { host, remoteName } = this.remoteOf(launcher);
+      return host.launchersSync()?.[remoteName]?.active ?? false;
+    }
+    return this.process.isActive(launcher);
   }
 
+  /** Null for a remote launcher. */
   getLauncherPid(name: string): number | null {
-    return this.process.getPid(this.getLauncher(name));
+    const launcher = this.getLauncher(name);
+    return launcher.remote === undefined ? this.process.getPid(launcher) : null;
   }
 
+  /** Undefined for a remote launcher (its log is on the remote machine: `stack logs` fetches it). */
   getLauncherLogFile(name: string): string | undefined {
-    return this.process.logFile?.(this.getLauncher(name));
+    const launcher = this.getLauncher(name);
+    return launcher.remote === undefined ? this.process.logFile?.(launcher) : undefined;
   }
 
   async getLauncherStatus(name: string): Promise<LauncherStatus> {
     const launcher = this.getLauncher(name);
+    if (launcher.remote !== undefined) {
+      const { host, remoteName } = this.remoteOf(launcher);
+      return host.status(remoteName);
+    }
 
     if (!this.process.isActive(launcher)) {
       return 'inactive';
@@ -195,6 +245,9 @@ export class Orchestrator {
 
   async stop(name: string, options: StopOptions = {}): Promise<void> {
     const launcher = this.getLauncher(name);
+    if (launcher.remote !== undefined) {
+      return this.remoteStop(launcher, options);
+    }
     if (!this.process.isActive(launcher)) {
       return;
     }
@@ -202,7 +255,14 @@ export class Orchestrator {
     await this.withGpu(`stop ${name}`, usesGpu(launcher), options, () => this.stopLauncher(launcher));
   }
 
+  /**
+   * Stops the local services and closes the tunnels to the remote machines. The services of a
+   * remote machine keep running: they are shared with its own clients.
+   */
   async stopAll(options: StopOptions = {}): Promise<void> {
+    for (const host of this.remotes.values()) {
+      await host.closeTunnels();
+    }
     const active = this.activeLaunchers();
     if (active.length === 0) {
       return;
@@ -220,6 +280,10 @@ export class Orchestrator {
    * prefer `withLease`, which does it.
    */
   async acquireLease(options: LeaseOptions): Promise<GpuLease> {
+    const remote = options.launcher === undefined ? undefined : this.getLauncher(options.launcher).remote;
+    if (remote !== undefined) {
+      return this.acquireRemoteLease(options);
+    }
     const waited = this.waitLogger(options.onWait);
     const lease = await this.requireGpu().lock.acquire({ ...options, onWait: waited.onWait });
     waited.acquired();
@@ -237,6 +301,25 @@ export class Orchestrator {
    * of taking their own, and a nested `withLease` reuses it.
    */
   async withLease<T>(options: LeaseOptions, fn: (lease: GpuLease) => Promise<T>): Promise<T> {
+    const launcher = options.launcher === undefined ? undefined : this.getLauncher(options.launcher);
+    if (launcher?.remote !== undefined) {
+      const { host, remoteName } = this.remoteOf(launcher);
+      const current = this.remoteLeaseFor(host.name);
+      if (current?.held) {
+        await current.command(`start ${remoteName}`);
+        host.invalidate();
+        await this.openTunnel(host, remoteName);
+        return fn(current);
+      }
+      const lease = await this.acquireRemoteLease(options);
+      try {
+        return await this.remoteLeaseContext.run(lease, () => fn(lease));
+      } finally {
+        lease.release();
+        // Returns once the remote machine has let go, like a local lease.
+        await lease.closed();
+      }
+    }
     const waited = this.waitLogger(options.onWait);
     return this.requireGpu().lock.withLease({ ...options, onWait: waited.onWait }, async (lease) => {
       waited.acquired();
@@ -248,6 +331,14 @@ export class Orchestrator {
   /** Marks the GPU as in use: background (P2) jobs wait for their quiet time from now. */
   touchGpu(): void {
     this.requireGpu().lock.touch();
+    for (const host of this.remotes.values()) host.touch();
+  }
+
+  /** The GPU queue of each remote machine (null when it does not answer; never wakes it). */
+  async remoteLeaseStatus(): Promise<Record<string, GpuStatus | null>> {
+    const hosts = [...this.remotes.values()];
+    const statuses = await Promise.all(hosts.map((host) => host.gpu()));
+    return Object.fromEntries(hosts.map((host, i) => [host.name, statuses[i] ?? null]));
   }
 
   /** Removes a waiting client from the GPU queue (`stack gpu cancel <id>`); null if it was not waiting. */
@@ -275,7 +366,7 @@ export class Orchestrator {
   }
 
   private async stopLauncher(launcher: Launcher): Promise<void> {
-    if (!this.process.isActive(launcher)) {
+    if (launcher.remote !== undefined || !this.process.isActive(launcher)) {
       return;
     }
 
@@ -295,7 +386,8 @@ export class Orchestrator {
       return fn();
     }
 
-    const lease = options.lease ?? gpu.lock.currentLease();
+    // A lease of another machine says nothing about this one's GPU.
+    const lease = (options.lease instanceof RemoteLease ? undefined : options.lease) ?? gpu.lock.currentLease();
     if (lease !== undefined) {
       if (!lease.held) {
         throw new GpuLeaseLostError(`GPU lease of ${lease.holder} is no longer held (released, or broken by another client)`);
@@ -347,7 +439,109 @@ export class Orchestrator {
   }
 
   private activeLaunchers(): Launcher[] {
-    return [...this.launchers.values()].filter((launcher) => this.process.isActive(launcher));
+    return [...this.launchers.values()].filter((launcher) => launcher.remote === undefined && this.process.isActive(launcher));
+  }
+
+  private remoteOf(launcher: Launcher): { host: RemoteHost; remoteName: string } {
+    const remote = launcher.remote;
+    const host = remote === undefined ? undefined : this.remotes.get(remote.host);
+    if (remote === undefined || host === undefined) {
+      throw new InvalidLauncherError(`${launcher.name}: remote machine '${remote?.host}' is not configured`);
+    }
+    return { host, remoteName: remote.name };
+  }
+
+  /** The lease of that machine given by the caller, or held by the enclosing `withLease`. */
+  private remoteLeaseFor(hostName: string, explicit?: GpuLease): RemoteLease | undefined {
+    if (explicit instanceof RemoteLease && explicit.remote === hostName) return explicit;
+    const current = this.remoteLeaseContext.getStore();
+    return current?.remote === hostName ? current : undefined;
+  }
+
+  /** Start (or restart) on the remote machine: under the caller's lease of that machine, or with its own lease there. */
+  private async remoteStart(launcher: Launcher, options: StartOptions, restart: boolean): Promise<void> {
+    const { host, remoteName } = this.remoteOf(launcher);
+    const lease = this.remoteLeaseFor(host.name, options.lease);
+    if (lease !== undefined) {
+      if (!lease.held) {
+        throw new GpuLeaseLostError(`GPU lease of ${lease.holder} on ${host.name} is no longer held`);
+      }
+      try {
+        await lease.command(`${restart ? 'restart' : 'start'} ${remoteName}`);
+      } finally {
+        host.invalidate();
+      }
+    } else {
+      const waited = this.waitLogger(options.onWait);
+      this.logger?.log(`${restart ? 'Restarting' : 'Starting'} ${launcher.name} on ${host.name}...`);
+      await host.start(remoteName, {
+        restart,
+        noWait: options.wait === false,
+        force: options.force,
+        priority: options.priority,
+        maxWait: options.maxWait,
+        signal: options.signal,
+        onWait: waited.onWait,
+        holder: `${this.gpu?.holder ?? 'stack'}: start ${launcher.name}`,
+      });
+      waited.acquired();
+    }
+    await this.openTunnel(host, remoteName, options.signal);
+  }
+
+  private async remoteStop(launcher: Launcher, options: StopOptions): Promise<void> {
+    const { host, remoteName } = this.remoteOf(launcher);
+    const lease = this.remoteLeaseFor(host.name, options.lease);
+    if (lease !== undefined) {
+      try {
+        await lease.command(`stop ${remoteName}`);
+      } finally {
+        host.invalidate();
+      }
+      return;
+    }
+    this.logger?.log(`Stopping ${launcher.name} on ${host.name}...`);
+    await host.stop(remoteName, {
+      force: options.force,
+      priority: options.priority,
+      maxWait: options.maxWait,
+      signal: options.signal,
+      onWait: this.waitLogger(options.onWait).onWait,
+      holder: `${this.gpu?.holder ?? 'stack'}: stop ${launcher.name}`,
+    });
+  }
+
+  private async acquireRemoteLease(options: LeaseOptions): Promise<RemoteLease> {
+    const { host, remoteName } = this.remoteOf(this.getLauncher(options.launcher as string));
+    const waited = this.waitLogger(options.onWait);
+    const lease = await host.lease({
+      holder: options.holder,
+      remoteName,
+      priority: options.priority,
+      maxWait: options.maxWait,
+      signal: options.signal,
+      onWait: waited.onWait,
+    });
+    waited.acquired();
+    try {
+      await this.openTunnel(host, remoteName, options.signal);
+    } catch (err) {
+      lease.release();
+      throw err;
+    }
+    return lease;
+  }
+
+  /** Opens the tunnel to the port of a remote launcher (none for a service without port). */
+  private async openTunnel(host: RemoteHost, remoteName: string, signal?: AbortSignal): Promise<void> {
+    const launchers = (await host.launchers({ signal })) ?? host.cachedLaunchers();
+    const info = launchers?.[remoteName];
+    if (launchers !== null && info === undefined) {
+      throw new InvalidLauncherError(`${remoteName} is not a launcher of ${host.name}`);
+    }
+    if (info?.port !== undefined) {
+      await host.ensureTunnel(info.port);
+    }
   }
 
   /** Waits for a freshly started process: health check if configured, otherwise a short survival check. */

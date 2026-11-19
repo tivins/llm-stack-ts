@@ -19,7 +19,33 @@ export interface StackConfig {
   /** Settings of the GPU job queue (`gpu_queue`); defaults apply to what is unset. */
   readonly gpuQueue?: GpuQueueConfig;
   readonly launchers: Launcher[];
+  /** Other machines whose services are driven over ssh (`[remotes.<name>]`). */
+  readonly remotes: RemoteConfig[];
   readonly warnings: ConfigWarning[];
+}
+
+/** A machine whose services `stack` drives over ssh (`[remotes.<name>]`). */
+export interface RemoteConfig {
+  readonly name: string;
+  /** ssh destination (`forge`, `user@host`), used for the commands and the tunnels. */
+  readonly ssh?: string;
+  /**
+   * Argv prefix that runs a remote command, the command string being appended as the last
+   * argument. Default: `ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh>`.
+   */
+  readonly command?: readonly string[];
+  /** `stack` command on the remote machine (default `stack`). */
+  readonly stack: string;
+  /** MAC address: the machine is woken with Wake-on-LAN when it does not answer. */
+  readonly wake?: string;
+  /** Broadcast address of the magic packet (default 255.255.255.255). */
+  readonly wakeBroadcast: string;
+  /** How long to wait for the machine after waking it (default 120 s). */
+  readonly wakeTimeoutMs: number;
+  /** Local port of a service = its remote port + `port_offset` (default 10000). */
+  readonly portOffset: number;
+  /** Opens an ssh tunnel to each remote port used (default true). False: the forward is managed elsewhere. */
+  readonly tunnel: boolean;
 }
 
 export interface GpuQueueConfig {
@@ -47,7 +73,13 @@ const NAME_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
 const VAR_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_-]*)\}/g;
 const KINDS: LauncherKind[] = ['command', 'llama-server'];
 
-const TOP_LEVEL_KEYS = ['$schema', 'vram_capacity_gb', 'vram_capacity_in_gigabytes', 'gpu_queue', 'vars', 'launchers'];
+const TOP_LEVEL_KEYS = ['$schema', 'vram_capacity_gb', 'vram_capacity_in_gigabytes', 'gpu_queue', 'vars', 'remotes', 'launchers'];
+const REMOTE_KEYS = ['ssh', 'command', 'stack', 'wake', 'wake_broadcast', 'wake_timeout_seconds', 'port_offset', 'tunnel'];
+/** The only keys of a launcher that runs on another machine: the rest is set over there. */
+const REMOTE_LAUNCHER_KEYS = ['name', 'remote', 'remote_name', 'description', 'type'];
+const DEFAULT_PORT_OFFSET = 10000;
+const DEFAULT_WAKE_TIMEOUT_SECONDS = 120;
+const MAC_PATTERN = /^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$/i;
 const GPU_QUEUE_KEYS = ['idle_seconds', 'switch_after_seconds', 'max_batch'];
 const LAUNCHER_KEYS = [
   'name',
@@ -70,6 +102,8 @@ const LAUNCHER_KEYS = [
   'process_match',
   'stop_timeout_seconds',
   'health',
+  'remote',
+  'remote_name',
 ];
 const HEALTH_KEYS = ['url', 'timeout_seconds', 'interval_ms', 'expected_status'];
 /** Keys merged key by key with the parent's value instead of replacing it. */
@@ -549,6 +583,89 @@ function cpuOnlyLayers(args: Readonly<Args> | undefined): boolean {
 }
 
 /** Builds the launchers from an already parsed stack file (JSON or TOML document). */
+function parseRemotes(raw: unknown, warnings: ConfigWarning[]): RemoteConfig[] {
+  if (raw === undefined) {
+    return [];
+  }
+  if (!isRecord(raw)) {
+    throw new StackConfigError('remotes must be a table of [remotes.<name>]');
+  }
+  return Object.entries(raw).map(([name, conf]) => {
+    const label = `remotes.${name}`;
+    if (!NAME_PATTERN.test(name)) {
+      throw new StackConfigError(`${label}: name may only contain letters, digits, '.', '_' and '-'`);
+    }
+    if (!isRecord(conf)) {
+      throw new StackConfigError(`${label} must be a table`);
+    }
+    warnUnknownKeys(conf, REMOTE_KEYS, label, warnings);
+    const ssh = optionalString(conf, 'ssh', label);
+    const command = conf.command;
+    if (command !== undefined && (!Array.isArray(command) || command.length === 0 || !command.every((c) => typeof c === 'string' && c !== ''))) {
+      throw new StackConfigError(`${label} command must be a non-empty array of strings`);
+    }
+    if (ssh === undefined && command === undefined) {
+      throw new StackConfigError(`${label} requires ssh (or command)`);
+    }
+    const tunnel = optionalBoolean(conf, 'tunnel', label) ?? true;
+    if (tunnel && ssh === undefined) {
+      throw new StackConfigError(`${label}: the tunnels need ssh (or set tunnel = false)`);
+    }
+    const wake = optionalString(conf, 'wake', label);
+    if (wake !== undefined && !MAC_PATTERN.test(wake)) {
+      throw new StackConfigError(`${label} wake must be a MAC address (aa:bb:cc:dd:ee:ff), got '${wake}'`);
+    }
+    const portOffset = conf.port_offset ?? DEFAULT_PORT_OFFSET;
+    if (typeof portOffset !== 'number' || !Number.isInteger(portOffset) || portOffset < 0 || portOffset > 60000) {
+      throw new StackConfigError(`${label} port_offset must be an integer between 0 and 60000`);
+    }
+    const wakeTimeout = conf.wake_timeout_seconds ?? DEFAULT_WAKE_TIMEOUT_SECONDS;
+    if (typeof wakeTimeout !== 'number' || wakeTimeout <= 0) {
+      throw new StackConfigError(`${label} wake_timeout_seconds must be a number > 0`);
+    }
+    return {
+      name,
+      ssh,
+      command: command as string[] | undefined,
+      stack: optionalString(conf, 'stack', label) ?? 'stack',
+      wake,
+      wakeBroadcast: optionalString(conf, 'wake_broadcast', label) ?? '255.255.255.255',
+      wakeTimeoutMs: wakeTimeout * 1000,
+      portOffset,
+      tunnel,
+    };
+  });
+}
+
+/** A launcher of another machine: only its name there, the rest is in that machine's stack file. */
+function buildRemoteLauncher(entry: Entry, remotes: readonly RemoteConfig[]): Launcher {
+  const { name, label, conf } = entry;
+  for (const key of Object.keys(conf)) {
+    if (!REMOTE_LAUNCHER_KEYS.includes(key) && LAUNCHER_KEYS.includes(key)) {
+      throw new StackConfigError(`${label} runs on ${String(conf.remote)}: '${key}' belongs in that machine's stack file`);
+    }
+  }
+  const host = optionalString(conf, 'remote', label) ?? '';
+  if (!remotes.some((r) => r.name === host)) {
+    throw new StackConfigError(`${label} remote '${host}' is not declared in [remotes]`);
+  }
+  const remoteName = optionalString(conf, 'remote_name', label) ?? name;
+  if (!NAME_PATTERN.test(remoteName)) {
+    throw new StackConfigError(`${label} remote_name '${remoteName}' is not a launcher name`);
+  }
+  return {
+    name,
+    description: optionalString(conf, 'description', label) ?? '',
+    type: optionalString(conf, 'type', label) ?? '',
+    commandLine: '',
+    vramGb: 0,
+    gpu: false,
+    exclusive: false,
+    stopTimeoutSeconds: DEFAULT_STOP_TIMEOUT_SECONDS,
+    remote: { host, name: remoteName },
+  };
+}
+
 export function parseStackConfig(parsed: unknown, source: string, options: LoadOptions = {}): StackConfig {
   if (!isRecord(parsed)) {
     throw new StackConfigError(`stack file must contain an object: ${source}`);
@@ -564,6 +681,7 @@ export function parseStackConfig(parsed: unknown, source: string, options: LoadO
 
   const gpuQueue = parseGpuQueue(parsed.gpu_queue, warnings);
   const vars = parseVars(parsed.vars, warnings);
+  const remotes = parseRemotes(parsed.remotes, warnings);
   const entries = collectEntries(parsed.launchers, source);
 
   const byName = new Map<string, Entry>();
@@ -582,15 +700,28 @@ export function parseStackConfig(parsed: unknown, source: string, options: LoadO
     if (entry.conf.abstract !== undefined && typeof entry.conf.abstract !== 'boolean') {
       throw new StackConfigError(`${entry.label} abstract must be true or false`);
     }
+    if (entry.conf.remote_name !== undefined && entry.conf.remote === undefined) {
+      throw new StackConfigError(`${entry.label} sets remote_name without remote`);
+    }
   });
+  for (const entry of entries) {
+    const parent = typeof entry.conf.extends === 'string' ? byName.get(entry.conf.extends) : undefined;
+    if (parent?.conf.remote !== undefined) {
+      throw new StackConfigError(`${entry.label} cannot extend ${parent.name}, which runs on ${String(parent.conf.remote)}`);
+    }
+  }
 
   const launchers = entries
     .filter((entry) => entry.conf.abstract !== true)
-    .map((entry) => buildLauncher(entry, resolveChain(entry, byName), vars, options.argOverrides?.[entry.name], warnings));
+    .map((entry) =>
+      entry.conf.remote !== undefined
+        ? buildRemoteLauncher(entry, remotes)
+        : buildLauncher(entry, resolveChain(entry, byName), vars, options.argOverrides?.[entry.name], warnings),
+    );
 
   // A parent's legacy key is reported once per child; keep each message once.
   const unique = [...new Map(warnings.map((w) => [`${w.level}:${w.message}`, w])).values()];
-  return { vramCapacityGb, gpuQueue, launchers, warnings: unique };
+  return { vramCapacityGb, gpuQueue, launchers, remotes, warnings: unique };
 }
 
 /** Reads a stack file as TOML (`.toml`) or JSON (anything else). */

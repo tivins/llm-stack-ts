@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { shellQuote, tokenize } from './args';
@@ -14,7 +14,8 @@ import { runLeaseSession } from './leaseSession';
 import type { LeaseEvent } from './leaseSession';
 import { ConsoleLogger } from './Logger';
 import type { Logger } from './Logger';
-import { createOrchestrator, summarizeLauncher } from './Stack';
+import type { Launcher } from './Launcher';
+import { createOrchestrator, describeLauncher } from './Stack';
 
 const HELP = `Usage: stack [options] <action> [name...]
 Options:
@@ -51,6 +52,7 @@ Actions:
                      With --json, events: waiting, granted, done, error, cancelled, released
   gpu                Show who holds the GPU lease and the queue, in the order clients will get it
   gpu cancel <id>    Remove a waiting client from the queue (its wait fails)
+  gpu touch          Mark the GPU as in use: background (P2) jobs wait for their quiet time from now
   gpu release --force
                      Break the current lease (its holder is not told and keeps running)
   logs <name>        Print the end of a service's log
@@ -85,10 +87,13 @@ class StderrLogger implements Logger {
   }
 }
 
-/** One JSON line on stdout; ignores a closed pipe (the remote client went away). */
+/**
+ * One JSON line on stdout, written synchronously so that it is not lost by a `process.exit`
+ * right after (an error, the end of `lease`); ignores a closed pipe (the client went away).
+ */
 function emitJson(value: unknown): void {
   try {
-    process.stdout.write(`${JSON.stringify(value)}\n`);
+    writeSync(1, `${JSON.stringify(value)}\n`);
   } catch {
     // EPIPE: nobody is reading anymore.
   }
@@ -149,10 +154,16 @@ async function holdLease(
   process.on('SIGTERM', onSignal);
   process.on('SIGHUP', onSignal);
 
+  const hosts = new Set(names.map((n) => orchestrator.getLauncher(n).remote?.host ?? ''));
+  if (hosts.size > 1) fail('--hold: these services are not all on the same machine');
+  const remote = [...hosts][0] !== '';
+
   let lease;
   try {
     lease = await orchestrator.acquireLease({
       holder: `stack: hold ${names.join(', ')}`,
+      // A remote lease is taken on that machine, with the first service started under it.
+      launcher: remote ? names[0] : undefined,
       priority: options.priority,
       maxWait: options.maxWait,
       signal: stopped.signal,
@@ -235,22 +246,64 @@ async function* stdinLines(): AsyncIterable<string> {
 }
 
 async function printStatusTable(orchestrator: Orchestrator, names: string[]): Promise<void> {
+  const withHosts = names.some((n) => orchestrator.getLauncher(n).remote !== undefined);
   const rows = await Promise.all(
     names.map(async (n) => {
       const launcher = orchestrator.getLauncher(n);
       const status = await orchestrator.getLauncherStatus(n);
       const pid = orchestrator.getLauncherPid(n);
-      return [
+      const remote = orchestrator.remoteInfo(n);
+      const gpu = remote ? (remote.info?.gpu ?? false) : launcher.gpu;
+      const row = [
         n,
         status,
         pid === null ? '-' : String(pid),
-        launcher.gpu ? `${launcher.vramGb}GB` : '-',
-        launcher.exclusive ? 'yes' : 'no',
-        launcher.health?.url ?? '-',
+        gpu ? `${remote ? remote.info?.size : launcher.vramGb}GB` : '-',
+        (remote ? remote.info?.exclusive : launcher.exclusive) ? 'yes' : 'no',
+        remote ? (remote.url ?? '-') : (launcher.health?.url ?? '-'),
       ];
+      return withHosts ? [row[0] as string, remote?.host.name ?? '-', ...row.slice(1)] : row;
     }),
   );
-  console.log(formatTable([['NAME', 'STATE', 'PID', 'VRAM', 'EXCLUSIVE', 'HEALTH'], ...rows]));
+  const header = ['NAME', 'STATE', 'PID', 'VRAM', 'EXCLUSIVE', 'HEALTH'];
+  console.log(formatTable([withHosts ? ['NAME', 'HOST', ...header.slice(1, 5), 'HEALTH / URL'] : header, ...rows]));
+}
+
+/** For `stack list`: a remote launcher shown with what its machine says (model, context, VRAM, local port). */
+function displayLauncher(orchestrator: Orchestrator, launcher: Launcher): Launcher {
+  const remote = orchestrator.remoteInfo(launcher.name);
+  if (remote === null) return launcher;
+  const info = remote.info;
+  const args: Args = {};
+  if (info?.model !== undefined) args.model = info.model;
+  if (info?.ctxSize !== undefined) args['ctx-size'] = info.ctxSize;
+  if (info?.reasoningBudget !== undefined) args['reasoning-budget'] = info.reasoningBudget;
+  return {
+    ...launcher,
+    type: launcher.type || info?.type || '',
+    description: launcher.description || info?.description || '',
+    args,
+    ownArgs: args,
+    port: remote.port,
+    vramGb: info?.size ?? 0,
+    gpu: info?.gpu ?? false,
+    exclusive: info?.exclusive ?? false,
+  };
+}
+
+/** Runs `stack <args>` on the remote machine of a launcher, output straight to this terminal. */
+async function passThrough(orchestrator: Orchestrator, name: string, args: string[]): Promise<number> {
+  const remote = orchestrator.remoteInfo(name);
+  if (remote === null) return 1;
+  const proc = Bun.spawn(remote.host.argv(args), { stdio: ['ignore', 'inherit', 'inherit'] });
+  return proc.exited;
+}
+
+function printGpuStatus(label: string, status: { holder: LeaseInfo | null; waiting: LeaseInfo[] } | null): void {
+  console.log(status?.holder ? `${label}held by ${describeJob(status.holder)}` : `${label}free`);
+  if (status && status.waiting.length > 0) {
+    console.log(`Waiting:\n${status.waiting.map((lease) => `  ${describeJob(lease)}`).join('\n')}`);
+  }
 }
 
 /** `--arg ctx-size=65536` → { 'ctx-size': '65536' }; `--arg embedding` → true; `--arg x=false` → false. */
@@ -421,7 +474,7 @@ async function main(): Promise<void> {
       }
       const tty = process.stdout.isTTY === true;
       console.log(
-        formatLauncherList(orchestrator.getLaunchers(), (n) => orchestrator.isLauncherActive(n), {
+        formatLauncherList(orchestrator.getLaunchers().map((l) => displayLauncher(orchestrator, l)), (n) => orchestrator.isLauncherActive(n), {
           color: tty && !process.env.NO_COLOR,
           width: tty ? process.stdout.columns : undefined,
         }),
@@ -432,8 +485,8 @@ async function main(): Promise<void> {
     case 'list-json': {
       const data: Record<string, unknown> = {};
       for (const launcher of orchestrator.getLaunchers()) {
-        const { name: _name, ...summary } = summarizeLauncher(launcher);
-        data[launcher.name] = { ...summary, active: orchestrator.isLauncherActive(launcher.name) };
+        const { name: _name, ...summary } = describeLauncher(orchestrator, launcher);
+        data[launcher.name] = summary;
       }
       console.log(JSON.stringify(data, null, 2));
       return;
@@ -461,7 +514,16 @@ async function main(): Promise<void> {
     case 'show': {
       assertKnownLaunchers(orchestrator, names);
       const shown = names.length > 0 ? names : orchestrator.getLaunchers().map((l) => l.name);
-      console.log(shown.map((n) => formatLauncher(orchestrator, n)).join('\n\n'));
+      for (const [i, n] of shown.entries()) {
+        const remote = orchestrator.getLauncher(n).remote;
+        if (i > 0) console.log('');
+        if (remote === undefined) {
+          console.log(formatLauncher(orchestrator, n));
+          continue;
+        }
+        console.log(`# ${n} runs on ${remote.host}${remote.name === n ? '' : ` as ${remote.name}`}; there:`);
+        await passThrough(orchestrator, n, ['show', remote.name]);
+      }
       return;
     }
 
@@ -510,6 +572,10 @@ async function main(): Promise<void> {
         console.log(broken === null ? 'GPU: free, nothing to release' : `Released the lease of ${describeLease(broken)}`);
         return;
       }
+      if (name === 'touch') {
+        orchestrator.touchGpu();
+        return;
+      }
       if (name === 'cancel') {
         const id = names[1];
         if (id === undefined) fail('missing id (shown by `stack gpu`)', true);
@@ -520,13 +586,16 @@ async function main(): Promise<void> {
       }
       if (name !== undefined) fail(`unknown gpu action '${name}'`, true);
       const status = orchestrator.leaseStatus();
+      // JSON stays the local queue only: it is what a remote client of this machine reads.
       if (values.json) {
         emitJson(status ?? { holder: null, waiting: [] });
         return;
       }
-      console.log(status?.holder ? `GPU: held by ${describeJob(status.holder)}` : 'GPU: free');
-      if (status && status.waiting.length > 0) {
-        console.log(`Waiting:\n${status.waiting.map((lease) => `  ${describeJob(lease)}`).join('\n')}`);
+      printGpuStatus('GPU: ', status);
+      const remotes = await orchestrator.remoteLeaseStatus();
+      for (const [host, remoteStatus] of Object.entries(remotes)) {
+        if (remoteStatus === null) console.log(`GPU of ${host}: unreachable`);
+        else printGpuStatus(`GPU of ${host}: `, remoteStatus);
       }
       return;
     }
@@ -562,6 +631,11 @@ async function main(): Promise<void> {
       assertKnownLaunchers(orchestrator, [name]);
       const lines = values.lines === undefined ? DEFAULT_LOG_LINES : Number(values.lines);
       if (!Number.isInteger(lines) || lines < 0) fail(`--lines must be a non-negative integer`);
+      const remoteLogs = orchestrator.getLauncher(name).remote;
+      if (remoteLogs !== undefined) {
+        process.exitCode = await passThrough(orchestrator, name, ['logs', remoteLogs.name, '-n', String(lines), ...(values.follow ? ['-F'] : [])]);
+        return;
+      }
       const logFile = orchestrator.getLauncherLogFile(name);
       if (!logFile || !existsSync(logFile)) fail(`no log for ${name} yet${logFile ? ` (${logFile})` : ''}`);
       const tail = Bun.spawn(['tail', '-n', String(lines), ...(values.follow ? ['-F'] : []), logFile], {
@@ -582,8 +656,22 @@ async function main(): Promise<void> {
           missingCount++;
         }
       }
+      for (const host of orchestrator.getRemotes()) {
+        const remoteLaunchers = await host.launchers();
+        const ours = orchestrator.getLaunchers().filter((l) => l.remote?.host === host.name);
+        if (remoteLaunchers === null) {
+          process.stderr.write(`Warning: ${host.name} cannot be reached, its ${ours.length} launcher(s) not checked\n`);
+          continue;
+        }
+        for (const launcher of ours) {
+          if (launcher.remote && !(launcher.remote.name in remoteLaunchers)) {
+            process.stderr.write(`Error: ${launcher.name}: ${host.name} has no launcher '${launcher.remote.name}'\n`);
+            missingCount++;
+          }
+        }
+      }
       if (missingCount > 0) {
-        fail(`${stackFile}: ${missingCount} missing path(s)`);
+        fail(`${stackFile}: ${missingCount} missing path(s) or remote launcher(s)`);
       }
       console.log(`OK: ${stackFile} (${config.launchers.length} launchers)`);
       return;

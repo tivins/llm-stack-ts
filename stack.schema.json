@@ -27,6 +27,43 @@
       "additionalProperties": { "type": ["string", "number"] },
       "description": "Variables usable as ${name} in launcher strings (command, args, cwd, env, health.url...). A variable may use the ones defined before it."
     },
+    "remotes": {
+      "type": "object",
+      "description": "Other machines whose services stack drives over ssh, with their own stack CLI and stack file. Their launchers are declared with remote = \"<name>\".",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "ssh": { "type": "string", "description": "ssh destination (alias of ~/.ssh/config, user@host)." },
+          "command": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "Argv prefix replacing ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh>; the remote command is appended as the last argument."
+          },
+          "stack": { "type": "string", "default": "stack", "description": "stack command on the remote machine." },
+          "wake": {
+            "type": "string",
+            "pattern": "^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$",
+            "description": "MAC address: Wake-on-LAN when the machine does not answer (start, restart, lease)."
+          },
+          "wake_broadcast": { "type": "string", "default": "255.255.255.255" },
+          "wake_timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "default": 120 },
+          "port_offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 60000,
+            "default": 10000,
+            "description": "Local port of a service = its remote port + port_offset."
+          },
+          "tunnel": {
+            "type": "boolean",
+            "default": true,
+            "description": "Open an ssh tunnel to each remote port used. False: the forward is managed elsewhere."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
     "launchers": {
       "oneOf": [
         {
@@ -114,6 +151,15 @@
         },
         "stop_timeout_seconds": { "type": "integer", "minimum": 1, "default": 10 },
         "health": { "$ref": "#/$defs/health" },
+        "remote": {
+          "type": "string",
+          "description": "Name of a [remotes.<name>] table: the service runs on that machine. Only name, remote_name, description and type may be set with it."
+        },
+        "remote_name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*$",
+          "description": "Launcher name on the remote machine (default: the same name)."
+        },
         "minimal_video_ram_usage_in_gigabytes": { "type": "number", "minimum": 0, "deprecated": true },
         "allow_full_cpu": { "type": ["boolean", "string"], "deprecated": true }
       },

@@ -7,6 +7,9 @@ export class StackConfigError extends Error {}
 
 export class ProcessExitedError extends Error {}
 
+/** A remote machine (`[remotes.<name>]`) does not answer over ssh, even after Wake-on-LAN. */
+export class RemoteUnreachableError extends Error {}
+
 /** The GPU lease was broken by another client (`stack gpu release --force`) or released already. */
 export class GpuLeaseLostError extends Error {}
 

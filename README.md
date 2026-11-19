@@ -164,6 +164,42 @@ Comme le bail, la file n'a pas de démon : chaque client relit les tickets du do
 
 Le bail ne coordonne que les clients de la stack. Le bureau (Xorg), le navigateur et les autres programmes prennent de la VRAM sans demander : environ 0,6 Go sur une carte de 16 Go avec un bureau et Firefox ouverts, davantage avec une vidéo ou du WebGL. Réglez donc `vram_capacity_gb` sous la capacité réelle de la carte (`15` pour 16 Go).
 
+### Machines distantes (`[remotes]`)
+
+Une autre machine qui a sa propre stack (son `stack` CLI, son `stack.toml`) se pilote d'ici par ssh. Ici, on déclare seulement la machine et les noms de ses services : modèle, VRAM, exclusivité restent dans le `stack.toml` de là-bas.
+
+```toml
+[remotes.forge]
+ssh = "forge"                     # alias de ~/.ssh/config (clé sans mot de passe ou agent)
+wake = "74:56:3c:5c:01:a7"        # optionnel : Wake-on-LAN si forge ne répond pas
+wake_broadcast = "192.168.2.255"  # défaut 255.255.255.255
+
+[launchers.qwen-32k]
+remote = "forge"                  # même nom là-bas
+
+[launchers.gemma-forge]
+remote = "forge"
+remote_name = "gemma"
+```
+
+| Clé de `[remotes.<nom>]` | Défaut | Rôle |
+|---|---|---|
+| `ssh` | requis | Destination ssh, pour les commandes et les tunnels |
+| `stack` | `stack` | Commande `stack` là-bas (dans le `PATH` d'un `ssh forge '…'`, avec `LLM_STACK_CONFIG`) |
+| `wake`, `wake_broadcast`, `wake_timeout_seconds` | —, `255.255.255.255`, `120` | Réveil par Wake-on-LAN, puis attente du ssh |
+| `port_offset` | `10000` | Port local d'un service = son port là-bas + `port_offset` |
+| `tunnel` | `true` | `false` : pas de tunnel (le transfert est géré ailleurs) |
+| `command` | — | Remplace `ssh … <ssh>` (le reste de la commande est ajouté en dernier argument) |
+
+Un launcher `remote` n'accepte que `remote_name`, `description` et `type` ; il ne s'étend pas et ne sert pas de parent.
+
+- **Commandes** : `start`, `restart`, `stop`, `status`, `show` et `logs` passent par `ssh forge stack … --json`. `stack list` et `stack status` montrent ce que dit forge (modèle, VRAM, état), avec `@forge` ou une colonne HOST.
+- **Bail** : un service de forge se démarre sous le bail **de forge**, dans sa file, à côté de ses propres clients (le worker guichet, par exemple). `withLease({ launcher: 'qwen-32k' })` et `acquire({ launcher })` prennent ce bail par `stack lease` (voir plus bas) : un chat en P0 d'ici passe devant un job P2 de là-bas, et ce job attend le calme. Sous ce bail, `start`/`stop` d'un autre service de forge l'utilisent. Le libellé affiché là-bas est `<machine d'ici>/<holder>`. Sans `launcher`, `withLease` prend le bail local, et un `start` distant prend un bail de forge le temps du démarrage seulement : pour garder le modèle le temps de s'en servir, il faut nommer le `launcher`.
+- **Tunnels** : `start` ouvre un tunnel ssh `127.0.0.1:<port + 10000>` → `forge:<port>` (un processus `ssh -N` suivi comme un service) et le relance s'il ne répond plus. Les services de forge restent en `127.0.0.1` là-bas. `stack stop` sans nom ferme les tunnels (et n'arrête jamais les services de forge, partagés avec ses autres clients).
+- **URL** : `listSummary()[name].url` donne l'URL de base de chaque service, locale ou au bout du tunnel ; c'est elle qu'il faut donner aux clients (`new LLM(summary.url)`), au lieu de construire `http://127.0.0.1:<port>`. `host` dit sur quelle machine il tourne.
+- **Machine éteinte** : `start`, `restart` et les baux la réveillent si `wake` est réglé, puis échouent avec `RemoteUnreachableError` si elle ne répond toujours pas (pas de repli sur un service local). `status`, `list`, `stop` et `gpu` ne la réveillent jamais : elle apparaît inactive.
+- `stack gpu` affiche aussi la file de chaque machine distante (`stack gpu --json` reste la file locale seule). `Stack.touch()` prévient aussi les machines distantes (au plus toutes les 10 s).
+
 ### Bail à distance (`stack lease`)
 
 `stack lease [name]` prend le bail et le garde **tant que son stdin reste ouvert**. Il démarre d'abord `name` sous le bail, s'il est donné, puis exécute sous ce bail les commandes lues sur stdin, une par ligne : `start <name>`, `restart <name>`, `stop <name>`, `touch`, `release`. Fermer stdin rend le bail ; le fermer pendant l'attente retire le job de la file.
@@ -210,6 +246,7 @@ stack start <name> --hold    # garde le bail GPU (P0) jusqu'à Ctrl+C, le servic
 stack lease [name] --holder "pc: chat" --priority 0   # garde le bail tant que stdin est ouvert (voir « Bail à distance »)
 stack gpu                   # qui tient le bail GPU, la file dans l'ordre de passage
 stack gpu cancel <id>       # retire un job de la file
+stack gpu touch             # repousse les jobs de fond (comme Stack.touch())
 stack gpu release --force   # casse le bail d'un client bloqué
 stack logs <name>           # dernières lignes du log (-n 100, --follow / -F)
 stack validate              # vérifie la configuration : clés obsolètes, fichiers de modèles et chemins absents, llama-server en gpu = false qui utilise le GPU
