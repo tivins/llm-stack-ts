@@ -296,6 +296,18 @@ describe('Orchestrator with a GPU lease', () => {
     expect(lock.status().holder).toBeNull();
   });
 
+  test('start: false keeps the launcher of the job without starting it', async () => {
+    const { process, orchestrator, lock } = withGpu();
+
+    await orchestrator.withLease({ holder: 'studio: image', launcher: 'gpu', start: false }, async () => {
+      expect(process.startCalls).toEqual([]);
+      expect(lock.status().holder?.launcher).toBe('gpu');
+      await orchestrator.ensureActive('gpu', { wait: false });
+      expect(process.startCalls).toEqual(['gpu']);
+    });
+    expect(lock.status().holder).toBeNull();
+  });
+
   test('start forwards priority, maxWait and onWait to the lease it takes', async () => {
     const { process, orchestrator, lock } = withGpu();
     const other = await lock.acquire({ holder: 'comfyui batch' });

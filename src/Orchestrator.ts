@@ -57,9 +57,16 @@ export interface LeaseOptions {
   priority?: JobPriority;
   /**
    * Launcher the job needs: started under the lease before the job runs, and used to run the
-   * jobs of the same launcher in a row.
+   * jobs of the same launcher in a row. For a launcher of another machine (`remote`), the lease
+   * is taken on that machine.
    */
   launcher?: string;
+  /**
+   * False: `launcher` is not started under the lease; it only picks the machine whose GPU is
+   * leased and groups the jobs. The job starts its services itself (to show their loading time),
+   * and they use this lease. Default true.
+   */
+  start?: boolean;
   /** Quiet time to wait for after the last P0/P1 activity (default: 60 s for P2, none otherwise). */
   idleMs?: number;
   /** Gives up after this long, with `GpuBusyError`. 0 = only if the GPU can be had at once. */
@@ -306,9 +313,11 @@ export class Orchestrator {
       const { host, remoteName } = this.remoteOf(launcher);
       const current = this.remoteLeaseFor(host.name);
       if (current?.held) {
-        await current.command(`start ${remoteName}`);
-        host.invalidate();
-        await this.openTunnel(host, remoteName);
+        if (options.start !== false) {
+          await current.command(`start ${remoteName}`);
+          host.invalidate();
+          await this.openTunnel(host, remoteName);
+        }
         return fn(current);
       }
       const lease = await this.acquireRemoteLease(options);
@@ -412,7 +421,7 @@ export class Orchestrator {
 
   /** Starts the launcher a job asked for, under its lease. */
   private async startJobLauncher(lease: GpuLease, options: LeaseOptions): Promise<void> {
-    if (options.launcher !== undefined) {
+    if (options.launcher !== undefined && options.start !== false) {
       await this.ensureActive(options.launcher, { lease, signal: options.signal });
     }
   }
@@ -514,15 +523,19 @@ export class Orchestrator {
   private async acquireRemoteLease(options: LeaseOptions): Promise<RemoteLease> {
     const { host, remoteName } = this.remoteOf(this.getLauncher(options.launcher as string));
     const waited = this.waitLogger(options.onWait);
+    const start = options.start !== false;
     const lease = await host.lease({
       holder: options.holder,
-      remoteName,
+      remoteName: start ? remoteName : undefined,
       priority: options.priority,
       maxWait: options.maxWait,
       signal: options.signal,
       onWait: waited.onWait,
     });
     waited.acquired();
+    if (!start) {
+      return lease;
+    }
     try {
       await this.openTunnel(host, remoteName, options.signal);
     } catch (err) {

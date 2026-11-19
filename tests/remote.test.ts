@@ -137,6 +137,25 @@ describe('remote launchers: driven through the remote stack', () => {
     await stack.stop('alias');
   }, 30000);
 
+  test('withLease with start: false leases the remote GPU without starting the launcher', async () => {
+    const remote = fakeRemote();
+    remotes.push(remote);
+    const { stack } = localStack(remote);
+    const remoteLock = new GpuLock(remote.lockDir);
+
+    await stack.withLease({ holder: 'studio: video', launcher: 'svc', start: false }, async () => {
+      expect(remoteLock.status().holder?.holder).toBe(`${hostname()}/studio: video`);
+      expect(stack.gpu().holder).toBeNull();
+      expect(stack.isActive('svc')).toBe(false);
+      // The job starts it itself, under the remote lease.
+      await stack.start('svc');
+      expect(stack.isActive('svc')).toBe(true);
+      expect(remoteLock.status().holder?.holder).toBe(`${hostname()}/studio: video`);
+    });
+    expect(remoteLock.status().holder).toBeNull();
+    await stack.stop('svc');
+  }, 30000);
+
   test('maxWait on a busy remote GPU gives GpuBusyError', async () => {
     const remote = fakeRemote();
     remotes.push(remote);

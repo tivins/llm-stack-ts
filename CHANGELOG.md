@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.0 - 2026-11-19
+
+### Added
+
+- Option `start` des baux (`withLease`, `acquire`) : `start: false` ne démarre pas `launcher` sous le bail ; il ne sert qu'à choisir la machine dont on prend le GPU (le bail de forge pour un launcher `remote`) et à grouper les jobs. Le job démarre ses services lui-même, sous ce bail. Pour un client qui veut montrer le temps de chargement (llm-multi-ts, `leaseGate(stack, { startLauncher: false })`) : sans cette option, il ne nommait pas le launcher, et un service de forge tournait sous un bail local seulement, sans le bail de forge.
+
 ## 0.11.1 - 2026-11-19
 
 ### Fixed
