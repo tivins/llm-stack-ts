@@ -10,12 +10,17 @@ import { migrateStackConfig } from './migrate';
 import type { Orchestrator } from './Orchestrator';
 import { describeLease } from './GpuLock';
 import type { JobPriority, LeaseInfo } from './GpuLock';
+import { runLeaseSession } from './leaseSession';
+import type { LeaseEvent } from './leaseSession';
 import { ConsoleLogger } from './Logger';
+import type { Logger } from './Logger';
 import { createOrchestrator, summarizeLauncher } from './Stack';
 
 const HELP = `Usage: stack [options] <action> [name...]
 Options:
   -f, --file <path>  Stack configuration file (default: $LLM_STACK_CONFIG, ./stack.toml, ./stack.json, or script dir)
+  --json             Machine-readable output on stdout (status, gpu, start, run, restart, stop, lease):
+                     one JSON object, or one per line for progress events; logs go to stderr
 Actions:
   list               List services by type, variants under their parent (* = active)
                      -q, --quiet  Names only
@@ -36,6 +41,14 @@ Actions:
   show [name...]     Print the resolved command line and settings (accepts --arg)
   stop [name...]     Stop one or more services, or every active service if none is given
                      (accepts --force, --priority, --max-wait)
+  lease [name]       Take the GPU lease and hold it while stdin stays open; closing stdin while still
+                     waiting leaves the queue. Starts <name> under the lease first, if given.
+                     Reads commands from stdin, one per line, run under the lease:
+                       start <name>, restart <name>, stop <name>, touch, release
+                     --holder <text>    Shown to the other clients (default: stack: lease <name>)
+                     --priority <0|1|2> Priority in the GPU queue (default: 1)
+                     --max-wait <s>     Give up if the lease is not granted within <s> seconds
+                     With --json, events: waiting, granted, done, error, cancelled, released
   gpu                Show who holds the GPU lease and the queue, in the order clients will get it
   gpu cancel <id>    Remove a waiting client from the queue (its wait fails)
   gpu release --force
@@ -62,7 +75,27 @@ function assertKnownLaunchers(orchestrator: Orchestrator, names: string[]): void
   }
 }
 
+/** Set by `--json`: errors are also written to stdout as `{"event":"error","message":...}`. */
+let jsonOutput = false;
+
+/** Logs to stderr, so that stdout only carries JSON with `--json`. */
+class StderrLogger implements Logger {
+  log(message: string): void {
+    process.stderr.write(`${message}\n`);
+  }
+}
+
+/** One JSON line on stdout; ignores a closed pipe (the remote client went away). */
+function emitJson(value: unknown): void {
+  try {
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+  } catch {
+    // EPIPE: nobody is reading anymore.
+  }
+}
+
 function fail(message: string, withUsage = false): never {
+  if (jsonOutput) emitJson({ event: 'error', message });
   process.stderr.write(`Error: ${message}\n`);
   if (withUsage) {
     process.stderr.write(HELP);
@@ -164,6 +197,41 @@ async function holdLease(
 function formatTable(rows: string[][]): string {
   const widths = rows[0]?.map((_, col) => Math.max(...rows.map((row) => row[col]?.length ?? 0))) ?? [];
   return rows.map((row) => row.map((cell, col) => cell.padEnd(widths[col] ?? 0)).join('  ').trimEnd()).join('\n');
+}
+
+async function printStatusJson(orchestrator: Orchestrator, names: string[]): Promise<void> {
+  const data: Record<string, unknown> = {};
+  for (const n of names) {
+    data[n] = { status: await orchestrator.getLauncherStatus(n), pid: orchestrator.getLauncherPid(n) };
+  }
+  emitJson(data);
+}
+
+/** Human form of the `stack lease` events (without --json). */
+function printLeaseEvent(event: LeaseEvent): void {
+  switch (event.event) {
+    case 'waiting':
+      return; // the orchestrator's logger already says who holds the GPU
+    case 'granted':
+      console.log(`GPU lease held (P${event.priority}${event.launcher ? `, ${event.launcher} ready` : ''}). Commands: start|restart|stop <name>, touch, release; Ctrl+D releases.`);
+      return;
+    case 'done':
+      console.log(`ok: ${event.cmd}`);
+      return;
+    case 'error':
+      process.stderr.write(`Error${event.cmd ? ` (${event.cmd})` : ''}: ${event.message}\n`);
+      return;
+    case 'cancelled':
+      console.log(`Left the GPU queue (${event.why === 'stdin' ? 'stdin closed' : 'interrupted'})`);
+      return;
+    case 'released':
+      console.log(`GPU lease released (${{ stdin: 'stdin closed', release: 'release', signal: 'interrupted', broken: 'broken by another client' }[event.why]})`);
+      return;
+  }
+}
+
+async function* stdinLines(): AsyncIterable<string> {
+  for await (const line of console) yield line;
 }
 
 async function printStatusTable(orchestrator: Orchestrator, names: string[]): Promise<void> {
@@ -279,6 +347,8 @@ async function main(): Promise<void> {
       hold: { type: 'boolean', default: false },
       priority: { type: 'string' },
       'max-wait': { type: 'string' },
+      holder: { type: 'string' },
+      json: { type: 'boolean', default: false },
       quiet: { type: 'boolean', short: 'q', default: false },
       lines: { type: 'string', short: 'n' },
       follow: { type: 'boolean', short: 'F', default: false },
@@ -292,6 +362,7 @@ async function main(): Promise<void> {
     return;
   }
 
+  jsonOutput = values.json;
   const [action, ...names] = positionals;
   const name = names[0];
   if (!action) {
@@ -321,13 +392,23 @@ async function main(): Promise<void> {
     }
   }
 
-  const orchestrator = createOrchestrator(config, { holder: 'stack', logger: new ConsoleLogger() });
+  const orchestrator = createOrchestrator(config, { holder: 'stack', logger: values.json ? new StderrLogger() : new ConsoleLogger() });
+  if (values.holder !== undefined && action !== 'lease') {
+    fail('--holder only applies to lease');
+  }
   if (values.hold && action !== 'start' && action !== 'run') {
     fail('--hold only applies to start and run');
   }
   const force = values.force;
   const priority = parsePriority(values.priority);
   const maxWait = parseMaxWait(values['max-wait']);
+  // With --json, start/restart/stop report their wait for the GPU and their end as JSON lines.
+  const onWait = values.json
+    ? (holder: LeaseInfo | null, me: { position: number; reason: string }) => emitJson({ event: 'waiting', holder, position: me.position, reason: me.reason })
+    : undefined;
+  const done = (cmd: string) => {
+    if (values.json) emitJson({ event: 'done', cmd });
+  };
 
   switch (action) {
     case 'list': {
@@ -371,7 +452,8 @@ async function main(): Promise<void> {
         if (overrides !== undefined && orchestrator.isLauncherActive(n)) {
           process.stderr.write(`Warning: ${n} is already running, use \`stack restart\` to apply --arg\n`);
         }
-        await orchestrator.ensureActive(n, { wait: !values['no-wait'], force, priority, maxWait });
+        await orchestrator.ensureActive(n, { wait: !values['no-wait'], force, priority, maxWait, onWait });
+        done(`start ${n}`);
       }
       return;
     }
@@ -387,13 +469,18 @@ async function main(): Promise<void> {
       if (names.length === 0) fail('missing service name', true);
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
-        await orchestrator.restart(n, { wait: !values['no-wait'], force, priority, maxWait });
+        await orchestrator.restart(n, { wait: !values['no-wait'], force, priority, maxWait, onWait });
+        done(`restart ${n}`);
       }
       return;
     }
 
     case 'status': {
       assertKnownLaunchers(orchestrator, names);
+      if (values.json) {
+        await printStatusJson(orchestrator, names.length > 0 ? names : orchestrator.getLaunchers().map((l) => l.name));
+        return;
+      }
       if (names.length === 1 && name) {
         console.log(await orchestrator.getLauncherStatus(name));
         return;
@@ -404,12 +491,14 @@ async function main(): Promise<void> {
 
     case 'stop': {
       if (names.length === 0) {
-        await orchestrator.stopAll({ force, priority, maxWait });
+        await orchestrator.stopAll({ force, priority, maxWait, onWait });
+        done('stop');
         return;
       }
       assertKnownLaunchers(orchestrator, names);
       for (const n of names) {
-        await orchestrator.stop(n, { force, priority, maxWait });
+        await orchestrator.stop(n, { force, priority, maxWait, onWait });
+        done(`stop ${n}`);
       }
       return;
     }
@@ -431,11 +520,41 @@ async function main(): Promise<void> {
       }
       if (name !== undefined) fail(`unknown gpu action '${name}'`, true);
       const status = orchestrator.leaseStatus();
+      if (values.json) {
+        emitJson(status ?? { holder: null, waiting: [] });
+        return;
+      }
       console.log(status?.holder ? `GPU: held by ${describeJob(status.holder)}` : 'GPU: free');
       if (status && status.waiting.length > 0) {
         console.log(`Waiting:\n${status.waiting.map((lease) => `  ${describeJob(lease)}`).join('\n')}`);
       }
       return;
+    }
+
+    case 'lease': {
+      if (names.length > 1) fail('lease takes at most one service name', true);
+      if (force) fail('lease takes the GPU lease, --force skips it');
+      if (name !== undefined) assertKnownLaunchers(orchestrator, [name]);
+      const interrupted = new AbortController();
+      const onSignal = () => interrupted.abort();
+      process.on('SIGINT', onSignal);
+      process.on('SIGTERM', onSignal);
+      process.on('SIGHUP', onSignal);
+      try {
+        const why = await runLeaseSession(
+          orchestrator,
+          { holder: values.holder ?? `stack: lease${name ? ` ${name}` : ''}`, priority, launcher: name, maxWait, signal: interrupted.signal },
+          stdinLines(),
+          values.json ? emitJson : printLeaseEvent,
+        );
+        if (why === 'broken') process.exitCode = 1;
+      } finally {
+        process.off('SIGINT', onSignal);
+        process.off('SIGTERM', onSignal);
+        process.off('SIGHUP', onSignal);
+      }
+      // stdin may still be open (release command, signal): do not wait for it.
+      process.exit(process.exitCode ?? 0);
     }
 
     case 'logs': {

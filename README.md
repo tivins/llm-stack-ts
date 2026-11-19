@@ -164,6 +164,24 @@ Comme le bail, la file n'a pas de démon : chaque client relit les tickets du do
 
 Le bail ne coordonne que les clients de la stack. Le bureau (Xorg), le navigateur et les autres programmes prennent de la VRAM sans demander : environ 0,6 Go sur une carte de 16 Go avec un bureau et Firefox ouverts, davantage avec une vidéo ou du WebGL. Réglez donc `vram_capacity_gb` sous la capacité réelle de la carte (`15` pour 16 Go).
 
+### Bail à distance (`stack lease`)
+
+`stack lease [name]` prend le bail et le garde **tant que son stdin reste ouvert**. Il démarre d'abord `name` sous le bail, s'il est donné, puis exécute sous ce bail les commandes lues sur stdin, une par ligne : `start <name>`, `restart <name>`, `stop <name>`, `touch`, `release`. Fermer stdin rend le bail ; le fermer pendant l'attente retire le job de la file.
+
+C'est la brique du pilotage d'une autre machine : lancé par `ssh`, le détenteur du bail est un processus de la machine du GPU, dans sa file, à côté de ses propres clients. Si le client ou le réseau tombe, sshd ferme stdin et le bail est rendu (moins de 2 s, mesuré sur forge).
+
+```sh
+ssh forge stack lease qwen-32k-chat --json --holder "pc/llm-chat: reply 12" --priority 0
+{"event":"waiting","holder":{"holder":"guichet: song 461",...},"position":0,"reason":"turn"}
+{"event":"granted","id":"2387.358f1225","priority":0,"launcher":"qwen-32k-chat"}
+start comfyui                      ← écrit sur stdin
+{"event":"done","cmd":"start comfyui"}
+                                   ← stdin fermé
+{"event":"released","why":"stdin"}
+```
+
+Avec `--json`, `status`, `gpu`, `start`, `run`, `restart` et `stop` écrivent aussi du JSON sur stdout (progression sur stderr). En librairie, la même boucle est `runLeaseSession(orchestrator, options, lignes, emit)`.
+
 ### Suivi des processus et logs
 
 `stack` mémorise le PID de chaque service qu'il lance (dans `<tmpdir>/stack-llm`) et le suit quoi qu'il exécute ensuite (un script `start.sh` qui fait `exec python ...` reste suivi). `stop` envoie le signal à tout le groupe de processus, donc les enfants d'un script ne restent pas orphelins.
@@ -189,6 +207,7 @@ stack stop <name...>        # arrête un ou plusieurs services
 stack start <name> --force  # n'attend pas le bail GPU (aussi sur restart et stop)
 stack start <name> --priority 0 --max-wait 30   # priorité dans la file, abandon après 30 s (aussi sur restart et stop)
 stack start <name> --hold    # garde le bail GPU (P0) jusqu'à Ctrl+C, le service reste actif ensuite
+stack lease [name] --holder "pc: chat" --priority 0   # garde le bail tant que stdin est ouvert (voir « Bail à distance »)
 stack gpu                   # qui tient le bail GPU, la file dans l'ordre de passage
 stack gpu cancel <id>       # retire un job de la file
 stack gpu release --force   # casse le bail d'un client bloqué

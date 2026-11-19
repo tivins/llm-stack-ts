@@ -19,5 +19,7 @@ export { migrateStackConfig } from './migrate';
 export type { MigrateOptions, MigrationResult } from './migrate';
 export { Stack, createOrchestrator, defaultLogDir, defaultPidDir, gpuLockDir, summarizeLauncher } from './Stack';
 export { formatLauncherList } from './listView';
+export { LEASE_COMMANDS, runLeaseSession } from './leaseSession';
+export type { LeaseEndReason, LeaseEvent, LeaseSessionOptions } from './leaseSession';
 export type { ListViewOptions } from './listView';
 export type { StackOptions, StackStartOptions, LauncherSummary } from './Stack';

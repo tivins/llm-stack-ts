@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.0 - 2026-11-19
+
+### Added
+
+- CLI : `stack lease [name]` prend le bail GPU et le garde tant que stdin reste ouvert ; fermer stdin pendant l'attente retire le job de la file. Démarre `name` sous le bail avant de le donner, puis exécute sous ce bail les commandes lues sur stdin, une par ligne : `start <name>`, `restart <name>`, `stop <name>`, `touch`, `release`. `--holder` (nouveau) fixe le libellé, `--priority` et `--max-wait` comme ailleurs. Lancé par `ssh`, le bail d'un client distant devient un processus de la machine du GPU : si le client ou le réseau tombe, sshd ferme stdin et le bail est rendu. Première étape du pilotage de forge depuis le PC principal (`llm-central/decisions/2026-11-19_forge_distant.md`).
+- CLI : `--json` sur `status`, `gpu`, `start`, `run`, `restart`, `stop` et `lease` : un objet JSON, ou une ligne JSON par événement (`waiting`, `granted`, `done`, `error`, `cancelled`, `released`) ; les messages de progression passent sur stderr et une erreur est aussi écrite sur stdout (`{"event":"error","message":…}`).
+- Librairie : `runLeaseSession()` (la boucle de `stack lease`, sur n'importe quelle source de lignes) et les types `LeaseEvent`, `LeaseEndReason`, `LeaseSessionOptions`.
+
 ## 0.9.1 - 2026-11-09
 
 ### Fixed

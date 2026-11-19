@@ -157,4 +157,54 @@ describe('cli', () => {
     expect(after.stdout).toContain('GPU: free');
     expect(status.stdout.trim()).toBe('ready');
   }, 20000);
+
+  test('lease --json holds the lease while stdin is open and runs its commands', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'llm-stack-ts-cli-'));
+    const file = path.join(dir, 'stack.toml');
+    writeFileSync(file, '[launchers.svc]\ncommand = "sleep 30"\nvram_gb = 1\n');
+    const env = { TMPDIR: dir, XDG_STATE_HOME: dir };
+
+    const proc = Bun.spawn(['bun', CLI, '-f', file, 'lease', '--json', '--holder', 'pc: test', '--priority', '0'], {
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, ...env },
+    });
+    const lines = proc.stdout.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = '';
+    const nextEvent = async (): Promise<Record<string, unknown>> => {
+      while (!buffer.includes('\n')) {
+        const { value, done } = await lines.read();
+        if (done) throw new Error(`stdout closed, got: ${buffer}`);
+        buffer += value;
+      }
+      const at = buffer.indexOf('\n');
+      const line = buffer.slice(0, at);
+      buffer = buffer.slice(at + 1);
+      return JSON.parse(line);
+    };
+
+    expect(await nextEvent()).toMatchObject({ event: 'granted', priority: 0 });
+    const gpu = JSON.parse((await runCli(['-f', file, 'gpu', '--json'], env)).stdout);
+    expect(gpu.holder).toMatchObject({ holder: 'pc: test', priority: 0, pid: proc.pid });
+
+    proc.stdin.write('start svc\n');
+    proc.stdin.flush();
+    expect(await nextEvent()).toEqual({ event: 'done', cmd: 'start svc' });
+    const status = JSON.parse((await runCli(['-f', file, 'status', '--json'], env)).stdout);
+    expect(status.svc.status).toBe('ready');
+
+    proc.stdin.end();
+    expect(await nextEvent()).toEqual({ event: 'released', why: 'stdin' });
+    expect(await proc.exited).toBe(0);
+    expect(JSON.parse((await runCli(['-f', file, 'gpu', '--json'], env)).stdout)).toEqual({ holder: null, waiting: [] });
+    await runCli(['-f', file, 'stop', 'svc'], env);
+  }, 20000);
+
+  test('--json errors are written to stdout too', async () => {
+    const result = await runCli(['-f', writeConfig(), 'status', 'missing', '--json']);
+
+    expect(result.code).toBe(1);
+    expect(JSON.parse(result.stdout)).toEqual({ event: 'error', message: 'invalid launcher: missing' });
+  });
 });
