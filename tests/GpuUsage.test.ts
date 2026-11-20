@@ -43,6 +43,7 @@ describe('GpuUsage', () => {
     const text = formatGpuUsage(usage, 'hour');
     expect(text).toContain('guichet');
     expect(text).toContain('total  26.3');
+    expect(text.split('\n')[0]).toBe('hour     Wh  mean W  peak W  busy  busy %  VRAM max');
   });
 
   test('a gap in the samples counts 30 s at most', () => {

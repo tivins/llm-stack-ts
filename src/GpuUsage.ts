@@ -170,7 +170,7 @@ export function formatGpuUsage(usage: GpuUsage, by: 'day' | 'hour'): string {
     p.project, p.leases ? String(p.leases) : '', minutes(p.seconds), p.wh.toFixed(1), `${percent(p.wh, usage.totalWh)}%`, meanW(p.wh, p.seconds),
   ]);
   return [
-    ...columns([[by, 'Wh', 'mean W', 'peak W', 'busy', 'busy', 'VRAM max'], ...rows]),
+    ...columns([[by, 'Wh', 'mean W', 'peak W', 'busy', 'busy %', 'VRAM max'], ...rows]),
     '',
     'Per project (while it held the GPU lease):',
     ...columns([['project', 'leases', 'time', 'Wh', 'share', 'mean W'], ...projects]),

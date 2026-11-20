@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.1 - 2026-11-20
+
+### Fixed
+
+- `stack gpu usage` : la colonne du temps occupé en pourcentage s'appelle `busy %` (deux colonnes s'appelaient `busy`).
+
 ## 0.14.0 - 2026-11-20
 
 ### Added
