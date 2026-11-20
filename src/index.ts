@@ -4,6 +4,8 @@ export { GpuBusyError, GpuLeaseLostError, InvalidLauncherError, ProcessExitedErr
 export { GpuLease, GpuLock, describeLease, formatDuration } from './GpuLock';
 export { appendGpuJournal, defaultGpuJournalDir, holderProject, readGpuJournal, summarizeGpuJournal } from './GpuJournal';
 export type { GpuJournalEntry, GpuJournalLine } from './GpuJournal';
+export { appendGpuSample, defaultGpuSamplesDir, formatGpuUsage, gpuSampleDays, MAX_SAMPLE_GAP_MS, NO_LEASE, readGpuSample, readGpuSamples, runGpuSampler, summarizeGpuUsage } from './GpuUsage';
+export type { GpuSample, GpuUsage, GpuUsageProject, GpuUsageRow } from './GpuUsage';
 export { DEFAULT_IDLE_MS, DEFAULT_MAX_BATCH, DEFAULT_SWITCH_AFTER_MS } from './GpuLock';
 export type { AcquireOptions, GpuLockOptions, GpuStatus, JobPriority, LeaseInfo, QueuePosition, WaitReason } from './GpuLock';
 export type { LauncherStatus } from './LauncherStatus';

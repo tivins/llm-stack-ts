@@ -1,0 +1,18 @@
+# `stack gpu sample` as a systemd user service, on the machine of the GPU:
+#   cp systemd/stack-gpu-sampler.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now stack-gpu-sampler
+# Keep it running without a session: `loginctl enable-linger $USER`. Read with `stack gpu usage`.
+[Unit]
+Description=llm-stack GPU sampler (power, use, VRAM) for stack gpu usage
+
+[Service]
+# `stack` loads the stack file: give it the same as your shell.
+Environment=LLM_STACK_CONFIG=%h/stack.toml
+Environment=PATH=%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.bun/bin/stack gpu sample
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

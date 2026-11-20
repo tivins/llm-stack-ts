@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.0 - 2026-11-20
+
+### Added
+
+- `stack gpu sample` : relève le GPU (puissance, utilisation, VRAM, température, par `nvidia-smi`) toutes les 10 s (`--interval`) dans `$XDG_STATE_HOME/llm-stack/gpu-samples/AAAA-MM-JJ.csv` ; service utilisateur fourni (`systemd/stack-gpu-sampler.service`). Reprend le script `gpu-sampler` de forge (même format de CSV).
+- `stack gpu usage [jours|AAAA-MM-JJ]` : Wh, puissance moyenne et maximale, temps occupé, VRAM maximale par jour ou par heure, puis Wh par projet en croisant avec le journal des baux ; `--json` donne les données. Reprend le script `gpu-usage` de forge.
+- Lib : `runGpuSampler`, `readGpuSample`, `appendGpuSample`, `readGpuSamples`, `gpuSampleDays`, `summarizeGpuUsage`, `formatGpuUsage`, `defaultGpuSamplesDir`.
+
 ## 0.13.0 - 2026-11-20
 
 ### Added

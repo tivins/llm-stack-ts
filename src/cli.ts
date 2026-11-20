@@ -9,6 +9,7 @@ import { formatLauncherList } from './listView';
 import { migrateStackConfig } from './migrate';
 import type { Orchestrator } from './Orchestrator';
 import { defaultGpuJournalDir, formatGpuHistory, readGpuJournal } from './GpuJournal';
+import { defaultGpuSamplesDir, formatGpuUsage, gpuSampleDays, readGpuSamples, runGpuSampler, summarizeGpuUsage } from './GpuUsage';
 import { describeLease } from './GpuLock';
 import type { JobPriority, LeaseInfo } from './GpuLock';
 import { runLeaseSession } from './leaseSession';
@@ -58,6 +59,12 @@ Actions:
                      Who held the GPU of this machine, per project (default: the last 7 days);
                      a date also lists each lease. --json prints the leases. Journal kept in
                      $XDG_STATE_HOME/llm-stack/gpu-journal (forge: ssh forge stack gpu history)
+  gpu sample         Read the GPU (power, use, VRAM, temperature) every few seconds, until stopped;
+                     meant for a service (see README). --interval <s> (default: 10).
+                     Samples in $XDG_STATE_HOME/llm-stack/gpu-samples, one CSV per day
+  gpu usage [days|YYYY-MM-DD]
+                     Energy of the GPU per day (default: the last 14 days with samples) or per
+                     hour of a date, then per project from the lease journal. --json for the data
   gpu release --force
                      Break the current lease (its holder is not told and keeps running)
   logs <name>        Print the end of a service's log
@@ -418,6 +425,7 @@ async function main(): Promise<void> {
       hold: { type: 'boolean', default: false },
       priority: { type: 'string' },
       'max-wait': { type: 'string' },
+      interval: { type: 'string' },
       holder: { type: 'string' },
       json: { type: 'boolean', default: false },
       quiet: { type: 'boolean', short: 'q', default: false },
@@ -607,6 +615,28 @@ async function main(): Promise<void> {
         const entries = readGpuJournal(defaultGpuJournalDir(), range.since, range.until);
         if (values.json) emitJson(entries);
         else console.log(formatGpuHistory(entries, range.title, range.detail));
+        return;
+      }
+      if (name === 'sample') {
+        const seconds = values.interval === undefined ? 10 : Number(values.interval);
+        if (!(seconds >= 1)) fail('--interval must be a number of seconds >= 1');
+        const stop = new AbortController();
+        for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.on(signal, () => stop.abort());
+        await runGpuSampler(defaultGpuSamplesDir(), seconds * 1000, stop.signal);
+        return;
+      }
+      if (name === 'usage') {
+        const dir = defaultGpuSamplesDir();
+        const arg = names[1];
+        const date = arg !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(arg);
+        const count = arg === undefined ? 14 : Number(arg);
+        if (!date && !(Number.isInteger(count) && count >= 1)) fail(`gpu usage expects a number of days or a date (YYYY-MM-DD), got '${arg}'`, true);
+        const days = date ? [arg!] : gpuSampleDays(dir).slice(-count);
+        const samples = readGpuSamples(dir, days);
+        const leases = samples.length === 0 ? [] : readGpuJournal(defaultGpuJournalDir(), samples[0]!.at, samples.at(-1)!.at + 1);
+        const usage = summarizeGpuUsage(samples, leases, date ? 'hour' : 'day');
+        if (values.json) emitJson(usage);
+        else console.log(formatGpuUsage(usage, date ? 'hour' : 'day'));
         return;
       }
       if (name !== undefined) fail(`unknown gpu action '${name}'`, true);

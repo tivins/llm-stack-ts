@@ -146,6 +146,12 @@ Plusieurs clients peuvent piloter la stack en même temps : le CLI, et des proje
 
 - Chaque bail rendu est écrit dans un journal (`$XDG_STATE_HOME/llm-stack/gpu-journal/AAAA-MM.jsonl`) : `stack gpu history` en tire le temps de GPU par projet. Un bail pris à distance est écrit sur la machine du GPU (`ssh forge stack gpu history`).
 
+### Consommation du GPU
+
+`stack gpu sample` relève le GPU (puissance, utilisation, VRAM, température, par `nvidia-smi`) toutes les 10 s (`--interval`) dans `$XDG_STATE_HOME/llm-stack/gpu-samples/AAAA-MM-JJ.csv`, jusqu'à son arrêt. On le fait tourner en service utilisateur sur la machine du GPU : `systemd/stack-gpu-sampler.service` (régler `LLM_STACK_CONFIG` dedans, `loginctl enable-linger` pour qu'il tourne sans session).
+
+`stack gpu usage` en tire les Wh, la puissance moyenne et maximale, le temps occupé (> 10 %) et la VRAM maximale, par jour (les 14 derniers jours relevés par défaut) ou par heure d'une date (`stack gpu usage 2026-11-20`), puis **par projet** : chaque relevé compte pour le projet qui tenait le bail à ce moment (journal des baux) ; `(no lease)` est le reste (repos, modèles restés chargés, travail sans bail). La carte seule : ni le CPU ni l'alimentation. Pour une machine distante : `ssh forge stack gpu usage`.
+
 ### File de jobs
 
 Chaque demande de bail est un job de la file, avec une **priorité** : `0` pour l'interactif (le chat), `1` pour ce que l'utilisateur vient de demander (une image ; c'est la valeur par défaut, y compris pour le CLI), `2` pour les tâches de fond. Le GPU revient :
@@ -251,6 +257,8 @@ stack gpu cancel <id>       # retire un job de la file
 stack gpu touch             # repousse les jobs de fond (comme Stack.touch())
 stack gpu release --force   # casse le bail d'un client bloqué
 stack gpu history [7|2026-11-20]  # qui a tenu le GPU, par projet (journal des baux)
+stack gpu sample            # relève le GPU toutes les 10 s (service, voir « Consommation du GPU »)
+stack gpu usage [14|2026-11-20]   # Wh par jour ou par heure, puis par projet
 stack logs <name>           # dernières lignes du log (-n 100, --follow / -F)
 stack validate              # vérifie la configuration : clés obsolètes, fichiers de modèles et chemins absents, llama-server en gpu = false qui utilise le GPU
 stack migrate               # convertit stack.json en stack.toml (-o fichier, --force)
