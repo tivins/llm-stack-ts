@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { Args } from './args';
 import { loadStackConfig, resolveStackFile } from './config';
 import type { ConfigWarning, StackConfig } from './config';
+import { defaultGpuJournalDir } from './GpuJournal';
 import { GpuLock } from './GpuLock';
 import type { GpuLease, GpuStatus, LeaseInfo } from './GpuLock';
 import type { Launcher } from './Launcher';
@@ -24,6 +25,8 @@ export interface StackOptions {
   pidDir?: string;
   /** Directory receiving each launcher's stdout/stderr. Defaults to $XDG_STATE_HOME/llm-stack/logs. */
   logDir?: string;
+  /** Directory of the journal of the GPU leases (`stack gpu history`). Defaults to $XDG_STATE_HOME/llm-stack/gpu-journal. */
+  gpuJournalDir?: string;
   /**
    * Prefix of the holder text of the GPU leases that start/stop take on their own, shown to the
    * other clients while they wait (`persona_helper` → `persona_helper: start comfyui`).
@@ -159,7 +162,7 @@ export function createOrchestrator(config: StackConfig, options: Omit<StackOptio
   const pidDir = options.pidDir ?? defaultPidDir();
   const processManager = new ProcessManager(pidDir, options.logger, options.logDir ?? defaultLogDir());
   const orchestrator = new Orchestrator(processManager, config.vramCapacityGb, options.logger, undefined, {
-    lock: new GpuLock(gpuLockDir(pidDir), config.gpuQueue),
+    lock: new GpuLock(gpuLockDir(pidDir), { ...config.gpuQueue, journalDir: options.gpuJournalDir ?? defaultGpuJournalDir() }),
     holder: options.holder ?? path.basename(process.argv[1] ?? 'bun'),
   });
   for (const launcher of config.launchers) {

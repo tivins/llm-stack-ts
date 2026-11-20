@@ -8,6 +8,7 @@ import { cpuOffloadWarnings, findMissingPaths, loadStackConfig, readStackFile, r
 import { formatLauncherList } from './listView';
 import { migrateStackConfig } from './migrate';
 import type { Orchestrator } from './Orchestrator';
+import { defaultGpuJournalDir, formatGpuHistory, readGpuJournal } from './GpuJournal';
 import { describeLease } from './GpuLock';
 import type { JobPriority, LeaseInfo } from './GpuLock';
 import { runLeaseSession } from './leaseSession';
@@ -53,6 +54,10 @@ Actions:
   gpu                Show who holds the GPU lease and the queue, in the order clients will get it
   gpu cancel <id>    Remove a waiting client from the queue (its wait fails)
   gpu touch          Mark the GPU as in use: background (P2) jobs wait for their quiet time from now
+  gpu history [days|YYYY-MM-DD]
+                     Who held the GPU of this machine, per project (default: the last 7 days);
+                     a date also lists each lease. --json prints the leases. Journal kept in
+                     $XDG_STATE_HOME/llm-stack/gpu-journal (forge: ssh forge stack gpu history)
   gpu release --force
                      Break the current lease (its holder is not told and keeps running)
   logs <name>        Print the end of a service's log
@@ -297,6 +302,19 @@ async function passThrough(orchestrator: Orchestrator, name: string, args: strin
   if (remote === null) return 1;
   const proc = Bun.spawn(remote.host.argv(args), { stdio: ['ignore', 'inherit', 'inherit'] });
   return proc.exited;
+}
+
+/** `stack gpu history [days|YYYY-MM-DD]`: the last 7 days by default; a date is that local day. */
+function historyRange(arg: string | undefined): { since: number; until: number; title: string; detail: boolean } {
+  const day = arg?.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (day) {
+    const since = new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3])).getTime();
+    const until = new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3]) + 1).getTime();
+    return { since, until, title: arg!, detail: true };
+  }
+  const days = arg === undefined ? 7 : Number(arg);
+  if (!Number.isInteger(days) || days < 1) fail(`gpu history expects a number of days or a date (YYYY-MM-DD), got '${arg}'`, true);
+  return { since: Date.now() - days * 24 * 3600_000, until: Infinity, title: `Last ${days} days`, detail: false };
 }
 
 function printGpuStatus(label: string, status: { holder: LeaseInfo | null; waiting: LeaseInfo[] } | null): void {
@@ -582,6 +600,13 @@ async function main(): Promise<void> {
         const cancelled = orchestrator.cancelLeaseRequest(id);
         if (cancelled === null) fail(`no waiting client with id ${id}`);
         console.log(`Cancelled ${describeJob(cancelled)}`);
+        return;
+      }
+      if (name === 'history') {
+        const range = historyRange(names[1]);
+        const entries = readGpuJournal(defaultGpuJournalDir(), range.since, range.until);
+        if (values.json) emitJson(entries);
+        else console.log(formatGpuHistory(entries, range.title, range.detail));
         return;
       }
       if (name !== undefined) fail(`unknown gpu action '${name}'`, true);

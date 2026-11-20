@@ -2,6 +2,8 @@ export { ConsoleLogger } from './Logger';
 export type { Logger } from './Logger';
 export { GpuBusyError, GpuLeaseLostError, InvalidLauncherError, ProcessExitedError, RemoteUnreachableError, StackConfigError } from './errors';
 export { GpuLease, GpuLock, describeLease, formatDuration } from './GpuLock';
+export { appendGpuJournal, defaultGpuJournalDir, holderProject, readGpuJournal, summarizeGpuJournal } from './GpuJournal';
+export type { GpuJournalEntry, GpuJournalLine } from './GpuJournal';
 export { DEFAULT_IDLE_MS, DEFAULT_MAX_BATCH, DEFAULT_SWITCH_AFTER_MS } from './GpuLock';
 export type { AcquireOptions, GpuLockOptions, GpuStatus, JobPriority, LeaseInfo, QueuePosition, WaitReason } from './GpuLock';
 export type { LauncherStatus } from './LauncherStatus';

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.0 - 2026-11-20
+
+### Added
+
+- Journal des baux GPU : chaque bail rendu ajoute une ligne JSON (holder, pid, priorité, launcher, demande, obtention, libération, `broken` si un autre client l'avait cassé) à `$XDG_STATE_HOME/llm-stack/gpu-journal/AAAA-MM.jsonl`. Il survit au redémarrage, contrairement au bail dans `/tmp`. Les baux pris à distance (`stack lease`) sont écrits sur la machine qui a le GPU. Un client qui meurt en tenant le bail n'écrit rien.
+- `stack gpu history [jours|AAAA-MM-JJ]` : temps de GPU tenu et temps d'attente par projet (texte du holder avant le premier `:`), 7 derniers jours par défaut ; une date liste aussi chaque bail ; `--json` donne les baux.
+- Lib : `GpuLockOptions.journalDir` (pas de journal si absent ; `Stack` et `createOrchestrator` le règlent), `StackOptions.gpuJournalDir`, `readGpuJournal`, `summarizeGpuJournal`, `formatGpuHistory`, `holderProject`, `defaultGpuJournalDir`.
+
 ## 0.12.0 - 2026-11-19
 
 ### Added

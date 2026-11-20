@@ -144,6 +144,8 @@ Plusieurs clients peuvent piloter la stack en même temps : le CLI, et des proje
 - `--force` (CLI) ou `{ force: true }` (librairie) passe outre, comme avant le bail.
 - Pas de démon : le bail repose sur des fichiers à côté des PID (`<tmpdir>/stack-llm/gpu/`). Un client qui meurt perd sa place, son bail ne bloque personne. Un client bloqué mais vivant, si : `stack gpu release --force` casse son bail (il n'est pas prévenu et continue comme s'il le tenait).
 
+- Chaque bail rendu est écrit dans un journal (`$XDG_STATE_HOME/llm-stack/gpu-journal/AAAA-MM.jsonl`) : `stack gpu history` en tire le temps de GPU par projet. Un bail pris à distance est écrit sur la machine du GPU (`ssh forge stack gpu history`).
+
 ### File de jobs
 
 Chaque demande de bail est un job de la file, avec une **priorité** : `0` pour l'interactif (le chat), `1` pour ce que l'utilisateur vient de demander (une image ; c'est la valeur par défaut, y compris pour le CLI), `2` pour les tâches de fond. Le GPU revient :
@@ -248,6 +250,7 @@ stack gpu                   # qui tient le bail GPU, la file dans l'ordre de pas
 stack gpu cancel <id>       # retire un job de la file
 stack gpu touch             # repousse les jobs de fond (comme Stack.touch())
 stack gpu release --force   # casse le bail d'un client bloqué
+stack gpu history [7|2026-11-20]  # qui a tenu le GPU, par projet (journal des baux)
 stack logs <name>           # dernières lignes du log (-n 100, --follow / -F)
 stack validate              # vérifie la configuration : clés obsolètes, fichiers de modèles et chemins absents, llama-server en gpu = false qui utilise le GPU
 stack migrate               # convertit stack.json en stack.toml (-o fichier, --force)

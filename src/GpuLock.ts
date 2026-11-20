@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { GpuBusyError, GpuLeaseLostError } from './errors';
+import { appendGpuJournal } from './GpuJournal';
 import { isProcessAlive, readProcStat } from './proc';
 import { sleep } from './sleep';
 
@@ -78,6 +79,8 @@ export interface GpuLockOptions {
   switchAfterMs?: number;
   /** Jobs run in a row for the same launcher before the others get their turn. */
   maxBatch?: number;
+  /** Writes each released lease there (`GpuJournal`); no journal when unset. `Stack` sets it. */
+  journalDir?: string;
 }
 
 interface TicketRecord {
@@ -126,6 +129,8 @@ export class GpuLease {
     readonly holder: string,
     private readonly ticketFile: string,
     readonly priority: JobPriority = DEFAULT_PRIORITY,
+    /** Where `release()` writes the lease (`GpuLockOptions.journalDir`), with what it knows of it. */
+    private readonly journal?: { dir: string; pid: number; launcher?: string; requestedAt: number; acquiredAt: number },
   ) {}
 
   /** False once released, or once another client broke the lease (`stack gpu release --force`). */
@@ -138,7 +143,19 @@ export class GpuLease {
       return;
     }
     this.released = true;
+    const broken = !existsSync(this.ticketFile);
     removeFile(this.ticketFile);
+    if (this.journal !== undefined) {
+      const { dir, ...known } = this.journal;
+      appendGpuJournal(dir, {
+        id: this.id,
+        holder: this.holder,
+        priority: this.priority,
+        ...known,
+        releasedAt: Date.now(),
+        ...(broken ? { broken: true as const } : {}),
+      });
+    }
     if (this.priority < 2) {
       writeActivity(this.dir);
     }
@@ -159,6 +176,7 @@ export class GpuLock {
   private readonly idleMs: number;
   private readonly switchAfterMs: number;
   private readonly maxBatch: number;
+  private readonly journalDir?: string;
 
   constructor(dir: string, options: GpuLockOptions = {}) {
     this.dir = dir.replace(/\/+$/, '');
@@ -166,6 +184,7 @@ export class GpuLock {
     this.idleMs = options.idleMs ?? DEFAULT_IDLE_MS;
     this.switchAfterMs = options.switchAfterMs ?? DEFAULT_SWITCH_AFTER_MS;
     this.maxBatch = options.maxBatch ?? DEFAULT_MAX_BATCH;
+    this.journalDir = options.journalDir;
     mkdirSync(this.dir, { recursive: true });
   }
 
@@ -200,13 +219,17 @@ export class GpuLock {
       removeFile(choosing);
     }
 
+    let acquiredAt: number;
     try {
-      await this.waitForTurn(id, ticketFile, record, options);
+      acquiredAt = await this.waitForTurn(id, ticketFile, record, options);
     } catch (err) {
       removeFile(ticketFile);
       throw err;
     }
-    return new GpuLease(this.dir, id, options.holder, ticketFile, priority);
+    const journal = this.journalDir === undefined
+      ? undefined
+      : { dir: this.journalDir, pid: process.pid, launcher: options.launcher, requestedAt: record.requestedAt, acquiredAt };
+    return new GpuLease(this.dir, id, options.holder, ticketFile, priority, journal);
   }
 
   /**
@@ -268,7 +291,8 @@ export class GpuLock {
     return holder;
   }
 
-  private async waitForTurn(id: string, ticketFile: string, record: TicketRecord, options: AcquireOptions): Promise<void> {
+  /** Resolves with the time the lease was granted. */
+  private async waitForTurn(id: string, ticketFile: string, record: TicketRecord, options: AcquireOptions): Promise<number> {
     const since = Date.now();
     let lastSeen: string | undefined;
     for (;;) {
@@ -284,7 +308,7 @@ export class GpuLock {
         const me = waiting[position];
 
         if (holder === null && me?.reason === undefined && (await this.claim(id, ticketFile, record, options.signal))) {
-          return;
+          return Date.now();
         }
 
         if (me !== undefined) {
