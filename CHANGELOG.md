@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.0 - 2026-11-22
+
+### Fixed
+
+- `Stack` relit le fichier de la stack quand il a changé (date de modification vérifiée à chaque appel). Avant, un process long (le worker guichet) gardait les launchers lus au démarrage : un launcher ajouté ensuite lui était inconnu, donc démarrer un service exclusif ne l'arrêtait pas et sa VRAM n'était pas comptée (ComfyUI et `qwen-moe-unc-128k` chargés ensemble sur forge). Un launcher retiré du fichier reste connu tant qu'il tourne. Un fichier qui ne se lit plus garde les launchers d'avant (message au logger). La table `[remotes]` n'est pas relue.
+- Lib : `Orchestrator.replaceLaunchers`.
+
 ## 0.14.1 - 2026-11-20
 
 ### Fixed

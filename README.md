@@ -288,6 +288,8 @@ import { ConsoleLogger, Stack } from 'llm-stack-ts';
 const stack = new Stack(); // résout la config comme le CLI (option file, $LLM_STACK_CONFIG, ./stack.toml, ./stack.json)
 // Silencieuse par défaut ; pour afficher la progression comme le CLI :
 // const stack = new Stack({ logger: new ConsoleLogger() });
+// Le fichier est relu dès qu'il change : un process long voit les launchers ajoutés depuis son
+// démarrage (et les arrête en lançant un service exclusif). La table [remotes] n'est pas relue.
 
 // Liste
 console.log(stack.listSummary());

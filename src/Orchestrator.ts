@@ -106,6 +106,21 @@ export class Orchestrator {
     this.launchers.set(launcher.name, launcher);
   }
 
+  /**
+   * Replaces every launcher (the stack file was edited). A local launcher removed from the file
+   * is kept while it still runs, so an exclusive start still stops it and counts its VRAM.
+   */
+  replaceLaunchers(launchers: readonly Launcher[]): void {
+    const names = new Set(launchers.map((launcher) => launcher.name));
+    const kept = [...this.launchers.values()].filter(
+      (old) => old.remote === undefined && !names.has(old.name) && this.process.isActive(old),
+    );
+    this.launchers.clear();
+    for (const launcher of [...launchers, ...kept]) {
+      this.launchers.set(launcher.name, launcher);
+    }
+  }
+
   /** A machine whose services are driven over ssh: the launchers with `remote = <its name>`. */
   addRemote(host: RemoteHost): void {
     this.remotes.set(host.name, host);

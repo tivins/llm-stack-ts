@@ -1,3 +1,4 @@
+import { statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Args } from './args';
@@ -181,20 +182,54 @@ export function createOrchestrator(config: StackConfig, options: Omit<StackOptio
  */
 export class Stack {
   private readonly orchestrator: Orchestrator;
-  /** Non-fatal issues found in the configuration file (unknown keys, deprecated keys). */
-  readonly warnings: readonly ConfigWarning[];
+  private readonly file: string;
+  private readonly options: StackOptions;
+  /** Modification time of the stack file when it was last read. */
+  private fileMtimeMs: number | undefined;
+  private configWarnings: readonly ConfigWarning[];
 
   constructor(options: StackOptions = {}) {
-    const config = loadStackConfig(resolveStackFile(options.file, import.meta.dir), { argOverrides: options.argOverrides });
-    this.warnings = config.warnings;
+    this.options = options;
+    this.file = resolveStackFile(options.file, import.meta.dir);
+    this.fileMtimeMs = mtimeMs(this.file);
+    const config = loadStackConfig(this.file, { argOverrides: options.argOverrides });
+    this.configWarnings = config.warnings;
     this.orchestrator = createOrchestrator(config, options);
   }
 
+  /** Non-fatal issues found in the configuration file (unknown keys, deprecated keys). */
+  get warnings(): readonly ConfigWarning[] {
+    this.refresh();
+    return this.configWarnings;
+  }
+
+  /**
+   * Reads the stack file again when it changed since the last read, so that a long-running
+   * process sees the launchers added since it started: an exclusive start then stops them.
+   * The `[remotes]` table is not read again. A file that no longer parses keeps the previous
+   * launchers (with a message to the logger) until it changes again.
+   */
+  private refresh(): void {
+    const current = mtimeMs(this.file);
+    if (current === undefined || current === this.fileMtimeMs) return;
+    this.fileMtimeMs = current;
+    try {
+      const config = loadStackConfig(this.file, { argOverrides: this.options.argOverrides });
+      this.orchestrator.replaceLaunchers(config.launchers);
+      this.configWarnings = config.warnings;
+      this.options.logger?.log(`Reloaded ${this.file}`);
+    } catch (err) {
+      this.options.logger?.log(`Kept the previous launchers, ${this.file} does not load: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   list(): Launcher[] {
+    this.refresh();
     return this.orchestrator.getLaunchers();
   }
 
   listSummary(): Record<string, LauncherSummary> {
+    this.refresh();
     const summary: Record<string, LauncherSummary> = {};
     for (const launcher of this.orchestrator.getLaunchers()) {
       summary[launcher.name] = describeLauncher(this.orchestrator, launcher);
@@ -207,19 +242,23 @@ export class Stack {
    * when another client holds it (unless `lease`, `force`, or inside `withLease`).
    */
   async start(name: string, options: StackStartOptions = {}): Promise<void> {
+    this.refresh();
     await this.orchestrator.ensureActive(name, { ...options, wait: !options.noWait });
   }
 
   async restart(name: string, options: StackStartOptions = {}): Promise<void> {
+    this.refresh();
     await this.orchestrator.restart(name, { ...options, wait: !options.noWait });
   }
 
   /** Resolves once the process has exited. */
   async stop(name: string, options: StopOptions = {}): Promise<void> {
+    this.refresh();
     await this.orchestrator.stop(name, options);
   }
 
   async stopAll(options: StopOptions = {}): Promise<void> {
+    this.refresh();
     await this.orchestrator.stopAll(options);
   }
 
@@ -230,11 +269,13 @@ export class Stack {
    * `launcher` (started before `fn`, and jobs for the loaded launcher run in a row), `maxWait`.
    */
   async withLease<T>(options: LeaseOptions, fn: (lease: GpuLease) => Promise<T>): Promise<T> {
+    this.refresh();
     return this.orchestrator.withLease(options, fn);
   }
 
   /** Waits for the GPU lease. Release it with `lease.release()`; pass it to start/stop as `{ lease }`. */
   async acquire(options: LeaseOptions): Promise<GpuLease> {
+    this.refresh();
     return this.orchestrator.acquireLease(options);
   }
 
@@ -262,19 +303,31 @@ export class Stack {
   }
 
   async status(name: string): Promise<LauncherStatus> {
+    this.refresh();
     return this.orchestrator.getLauncherStatus(name);
   }
 
   isActive(name: string): boolean {
+    this.refresh();
     return this.orchestrator.isLauncherActive(name);
   }
 
   pid(name: string): number | null {
+    this.refresh();
     return this.orchestrator.getLauncherPid(name);
   }
 
   /** Path of the file receiving the launcher's stdout/stderr. */
   logFile(name: string): string | undefined {
+    this.refresh();
     return this.orchestrator.getLauncherLogFile(name);
+  }
+}
+
+function mtimeMs(file: string): number | undefined {
+  try {
+    return statSync(file).mtimeMs;
+  } catch {
+    return undefined;
   }
 }
